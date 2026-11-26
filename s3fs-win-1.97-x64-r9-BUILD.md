@@ -1,5 +1,7 @@
 # s3fs-fuse 1.97 Windows x64 构建说明（r9）
 
+[English](s3fs-win-1.97-x64-r9-BUILD-en.md) | 简体中文
+
 > 本项目（Windows 适配补丁与本文档）由 AI 生成，经人工实测验收。
 
 Linux mingw-w64 交叉编译 + WinFsp 2.2 FUSE3 兼容层。当前权威版本 r9。

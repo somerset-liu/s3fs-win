@@ -7,7 +7,7 @@
 A Windows tray GUI frontend that wraps `s3fs.exe` (s3fs-fuse 1.97, with the FUSE layer provided by WinFsp).
 This directory contains the full source of the rewrite.
 
-Repository contents: `*.cs` + `S3fsWinGui.csproj` (tray frontend source); `s3fs-win-1.97-x64-r9.patch` (all Windows adaptations for s3fs-fuse 1.97, applies to pristine upstream with `git apply`); `s3fs-win-1.97-x64-r9-BUILD.md` (cross-compilation steps and Windows pitfalls).
+Repository contents: `*.cs` + `S3fsWinGui.csproj` (tray frontend source); `s3fs-win-1.97-x64-r9.patch` (all Windows adaptations for s3fs-fuse 1.97, applies to pristine upstream with `git apply`); `s3fs-win-1.97-x64-r9-BUILD-en.md` (cross-compilation steps and Windows pitfalls).
 
 - Target framework: `net8.0-windows` + WinForms, published as a self-contained single file (no .NET install needed on target machines)
 - Cross-compiled on Linux, and run on real Windows machines.
