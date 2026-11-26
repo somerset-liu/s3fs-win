@@ -1,152 +1,175 @@
-# s3fs-win 托盘前端（源码）
+# s3fs-win Tray Frontend (Source)
 
-> ⚠️ **本项目由 AI 生成**（含全部源码与文档），经人工实测验收。 AI-generated; human-reviewed.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-Windows 托盘图形前端，包装同目录下的 `s3fs.exe`（s3fs-fuse 1.97，FUSE 层走 WinFsp）。
-本目录是重写版的全部源码。
+> ⚠️ **This project is AI-generated** (all source code and documentation) and has been reviewed and tested by a human.
 
-仓库内容：`*.cs` + `S3fsWinGui.csproj`（托盘前端源码）；`s3fs-win-1.97-x64-r9.patch`（s3fs-fuse 1.97 的全部 Windows 适配，对 pristine 上游可直接 `git apply`）；`s3fs-win-1.97-x64-r9-BUILD.md`（交叉编译步骤与 Windows 坑位）。
+A Windows tray GUI frontend that wraps `s3fs.exe` (s3fs-fuse 1.97, with the FUSE layer provided by WinFsp).
+This directory contains the full source of the rewrite.
 
-- 目标框架：`net8.0-windows` + WinForms，自包含单文件发布（用户机不用装 .NET）
-- 在 Linux 上交叉编译 + 用 Windows 实机跑过
+Repository contents: `*.cs` + `S3fsWinGui.csproj` (tray frontend source); `s3fs-win-1.97-x64-r9.patch` (all Windows adaptations for s3fs-fuse 1.97, applies to pristine upstream with `git apply`); `s3fs-win-1.97-x64-r9-BUILD.md` (cross-compilation steps and Windows pitfalls).
 
-## 构建
+- Target framework: `net8.0-windows` + WinForms, published as a self-contained single file (no .NET install needed on target machines)
+- Cross-compiled on Linux, and run on real Windows machines.
+
+## Build
 
 ```bash
-dotnet build -c Release --no-incremental                                   # 要求 0 警告 0 错误
+dotnet build -c Release --no-incremental                                   # must be 0 warnings, 0 errors
 dotnet publish -c Release -r win-x64 --self-contained true \
-    -p:PublishSingleFile=true                                              # publish 目录只有 1 个 exe
+    -p:PublishSingleFile=true                                              # publish dir contains a single exe
 ```
 
-发布配置里开了 `IncludeAllContentForSelfExtract` 与 `EnableCompressionInSingleFile`：
-前者把 WindowsDesktop 的几个原生 DLL 也打进单文件（否则 publish 目录会多出 5 个 DLL），
-后者压一遍体积（65 MB 量级）。代价是首次运行会解压到临时目录，启动多几百毫秒。
+The publish configuration enables `IncludeAllContentForSelfExtract` and `EnableCompressionInSingleFile`:
+the former packs the WindowsDesktop native DLLs into the single file (otherwise the publish directory would
+contain 5 extra DLLs), the latter compresses it (on the order of 65 MB). The cost is that the first run
+extracts to a temp directory, adding a few hundred milliseconds to startup.
 
-产物拷到部署目录后改名/就叫 `s3fs-win.exe`，跟 `s3fs.exe`、23 个 DLL、`mime.types` 放同一层。
+Copy the output to the deployment directory named `s3fs-win.exe`, alongside `s3fs.exe`, the 23 DLLs and `mime.types`.
 
-## 先装 WinFsp（必须）
+## Install WinFsp first (required)
 
-`s3fs.exe` 自己不带内核驱动，盘符由 WinFsp 提供。没装就挂不上，报：
+`s3fs.exe` does not ship a kernel driver; the drive letter is provided by WinFsp. Without it, mounting fails with:
 
 ```
 Cannot create WinFsp-FUSE file system: FSD not found.
 ```
 
-跑包里的 `winfsp-2.2.26323.msi` 即可（要管理员，装完不用重启）。
-程序认得这行日志，会直接在日志框里标出来，不用去猜。
+Run the bundled `winfsp-2.2.26323.msi` (requires admin, no reboot needed).
+The program recognizes this log line and flags it directly in the log pane.
 
-## 界面字段
+## UI fields
 
-| 字段 | 对应 s3fs 参数 | 说明 |
+| Field | s3fs argument | Notes |
 | --- | --- | --- |
-| 桶名 | 位置参数 | 原样传，不做斜杠转换 |
-| 端点 URL | `-o url=` | 例 `https://s3.example.com:9000`；服务端若只收 https，写 `http://` 会被回 400 |
-| Access Key / Secret Key | 写进凭据文件 | 两者都非空时程序代写 `passwd-s3fs`；任一为空则不代写、只用文件里已有的内容，并在日志与气泡里明确提示 |
-| 挂载点 | 位置参数 | 盘符写 `S:`（`S:\` 会自动归一成 `S:`），也可以是已存在的目录 |
-| 凭据文件 | `-o passwd_file=` | 默认 `<exe 目录>\passwd-s3fs`，内容一行 `桶名:AccessKey:SecretKey`（也接受 `AccessKey:SecretKey`），UTF-8 无 BOM |
-| mime 文件 | `-o mime=` | 默认 `<exe 目录>\mime.types`。s3fs 在 Windows 上只找 `/etc/mime.types`，不传就是没有 Content-Type |
-| 临时目录 tmpdir | `-o tmpdir=` | **必给**，默认 `<exe 目录>\tmp`，挂载前自动创建 |
-| 缓存目录 use_cache | `-o use_cache=` | 留空即不带这个选项（磁盘读缓存）。跟 tmpdir 是两回事 |
-| 额外选项 options | 逐个 `-o` | 逗号分隔，默认 `use_path_request_style,listobjectsv2,retries=5,connect_timeout=30` |
-| 调试日志 | `-o dbglevel=info` | 勾上就加，用的是 `dbglevel`，不是 `-d` |
-| 开机自启 | HKCU Run 项 | 见下 |
+| Bucket | positional | Passed through as-is, no slash conversion |
+| Endpoint URL | `-o url=` | e.g. `https://s3.example.com:9000`; if the server only accepts https, `http://` gets a 400 |
+| Access Key / Secret Key | written to the credential file | When both are non-empty the program writes `passwd-s3fs` for you; if either is empty it does not, only uses what the file already contains, and says so in the log and a notification |
+| Mount point | positional | Drive letter like `S:` (`S:\` is normalized to `S:`), or an existing directory |
+| Credential file | `-o passwd_file=` | Defaults to `<exe dir>\passwd-s3fs`, one line `bucket:AccessKey:SecretKey` (`AccessKey:SecretKey` also accepted), UTF-8 without BOM |
+| MIME file | `-o mime=` | Defaults to `<exe dir>\mime.types`. On Windows s3fs only looks for `/etc/mime.types`; without this option there is no Content-Type |
+| Temp dir tmpdir | `-o tmpdir=` | **Always set**, defaults to `<exe dir>\tmp`, created before mounting |
+| Cache dir use_cache | `-o use_cache=` | Empty = option not passed (on-disk read cache). Separate from tmpdir |
+| Extra options | one `-o` each | Comma-separated, defaults to `use_path_request_style,listobjectsv2,retries=5,connect_timeout=30` |
+| Debug log | `-o dbglevel=info` | Added when checked; uses `dbglevel`, not `-d` |
+| Start with Windows | HKCU Run entry | See below |
 
-### 参数拼装的几条硬规矩
+### Hard rules of argument assembly
 
-1. **进 `-o` 的路径一律转成正斜杠绝对路径**。s3fs 解析 `-o` 的 value 时把 `\` 当转义符吃掉，
-   `passwd_file=C:\Soft\s3fs-win\passwd-s3fs` 会变成 `stat(C:Softs3fs-winpasswd-s3fs)` 然后退出码 1。
-   相对路径也不行：`tmpdir=tmp` 在 mingw 下 `statvfs` 拿不到容量，会误报 “not enough disk space … already has 0.000 MB”。
-2. 参数用 `ProcessStartInfo.ArgumentList` 逐项 `Add`，不手拼字符串，路径带空格也不会断。
-3. **同名选项只出现一次**，且写在 options 里的同名项**优先于**程序自动生成的值。
-   程序托管的项：`passwd_file` / `url` / `no_check_certificate` / `mime` / `tmpdir` / `use_cache` / `umask` / `dbglevel` / `use_path_request_style`。
-   （`use_path_request_style` 的默认值就在 options 文本框里，删掉它表示你要用虚拟主机风格。）
-4. `tmpdir` 永远出现在命令行上（s3fs 的临时目录硬编码 `/tmp` 且不读 `TMP`/`TEMP`）；
-   目录建不出来只记日志、不弹异常窗（exe 放在 `Program Files` 这类只读目录时常见）。
-5. 不带 `-f` 之外的调试开关；挂载是 `-f` 前台子进程，由本程序持有，结束它即卸载。
-6. 1.97 没有 `readdir_optimize`，写上去属于未知选项、直接致命退出；读旧配置时会自动剔除。
-7. **`no_check_certificate` 始终加上**（跟在 `url` 后面）。服务端只收 https 且证书自签时（没有受信 CA 签发），
-   而 s3fs 1.95/1.97 **没有 `CAfile`/`capath`** 可以指定信任哪张证书，只能整块跳过校验；
-   少了它就报 `server certificate verification failed` / `SSL: error`。
-   换成正式 CA 证书后这个选项可以去掉（在 options 里写同名项即可覆盖，去重后仍只出现一次）。
+1. **Paths that go into `-o` are always converted to absolute paths with forward slashes.** s3fs treats `\`
+   as an escape character when parsing `-o` values: `passwd_file=C:\Soft\s3fs-win\passwd-s3fs` turns into
+   `stat(C:Softs3fs-winpasswd-s3fs)` and exit code 1. Relative paths fail too: `tmpdir=tmp` makes mingw's
+   `statvfs` unable to report capacity, producing a bogus "not enough disk space … already has 0.000 MB".
+2. Arguments are added one by one via `ProcessStartInfo.ArgumentList`, never hand-concatenated, so paths with
+   spaces survive.
+3. **Each option name appears at most once**, and the same option written in the options field **takes priority
+   over** program-generated values. Program-managed options: `passwd_file` / `url` / `no_check_certificate` /
+   `mime` / `tmpdir` / `use_cache` / `umask` / `dbglevel` / `use_path_request_style`.
+   (The `use_path_request_style` default sits in the options textbox; removing it switches you to
+   virtual-host-style addressing.)
+4. `tmpdir` is always on the command line (s3fs hardcodes `/tmp` as its temp dir and ignores `TMP`/`TEMP`);
+   if the directory cannot be created it is only logged, no exception dialog (common when the exe sits in a
+   read-only directory like `Program Files`).
+5. No debug switches other than `-f`; mounting runs as a `-f` foreground child process owned by this program,
+   and stopping it unmounts.
+6. 1.97 has no `readdir_optimize`; writing it is an unknown option and exits fatally. It is removed
+   automatically when reading older configs.
+7. **`no_check_certificate` is always added** (right after `url`). When the server only accepts https with a
+   self-signed certificate, and s3fs 1.95/1.97 has **no `CAfile`/`capath`** to trust a specific certificate,
+   skipping verification entirely is the only option; without it you get
+   `server certificate verification failed` / `SSL: error`.
+   Once you switch to a proper CA certificate the option can be dropped (write the same option in the options
+   field to override; dedup keeps a single occurrence).
 
-8. **`umask=000` 始终加上**（跟在 `tmpdir` / `use_cache` 后面）。s3fs 报的是 POSIX 权限，WinFsp 要把
-   `st_mode` + uid/gid 翻译成 Windows ACL；默认 umask 下根目录翻出来是 `0755`，而属主 uid 在 Windows 侧
-   对不上任何账户，资源管理器可能把整个盘符判成「拒绝访问」。**若出现拒绝访问先加这个**：加上之后拒绝
-   访问确实消失了，但两者因果在真机上还没确认（也可能是挂载还没起来时的时序问题），别当成已证实的修复。
-   副作用是盘符上不再区分属主，人人可读写；要收紧就在 options 里写 `umask=022`。
+8. **`umask=000` is always added** (after `tmpdir` / `use_cache`). s3fs reports POSIX permissions and WinFsp
+   translates `st_mode` + uid/gid into Windows ACLs; with the default umask the root dir translates to `0755`,
+   while the owner uid matches no Windows account, so Explorer may show the whole drive as "Access denied".
+   **If you see access denied, add this first**: adding it did make the error disappear, but the causality has
+   not been confirmed on real hardware (it may also have been a timing issue while the mount was not yet up),
+   so treat it as an unproven fix. Side effect: the drive no longer distinguishes owners, everyone can read
+   and write; tighten with `umask=022` in the options field if needed.
 
-## 配置文件 config.json
+## Config file config.json
 
-跟 exe 同目录，**首次运行自动生成**，UTF-8 无 BOM、camelCase；文件缺字段就用默认值，
-读不懂（语法坏了）也只用默认值继续跑，不弹窗。字段名与界面一一对应：
-`bucket`、`endpoint`、`accessKeyId`、`secretAccessKey`、`mountPoint`、`passwdFile`、`mimeFile`、
-`tmpDir`、`cacheDir`、`options`、`debug`、`autoStart`、`autoMountOnStart`、`startInTray`、`minimizeToTray`。
+Lives next to the exe, **auto-created on first run**, UTF-8 without BOM, camelCase; missing fields fall back
+to defaults, and an unreadable (broken-syntax) file also just falls back to defaults without any dialog.
+Field names map 1:1 to the UI: `bucket`, `endpoint`, `accessKeyId`, `secretAccessKey`, `mountPoint`,
+`passwdFile`, `mimeFile`, `tmpDir`, `cacheDir`, `options`, `debug`, `autoStart`, `autoMountOnStart`,
+`startInTray`, `minimizeToTray`.
 
-- `minimizeToTray`（默认 true）：点关闭只是隐藏到托盘；托盘菜单里的「退出」才结束程序（退出前自动卸载）。
-- `autoMountOnStart`：启动后立刻挂载，配合 `--min` 做无人值守。界面上没有这个勾选框，只改配置文件。
+- `minimizeToTray` (default true): clicking close only hides to the tray; "Exit" in the tray menu ends the
+  program (auto-unmount before exit).
+- `autoMountOnStart`: mounts immediately after launch, combine with `--min` for unattended use. There is no
+  checkbox for it in the UI; edit the config file only.
 
-> **从旧版本升级的要手动改一处**：老 `config.json` 里的 `endpoint` 存的是 `http://s3.example.com:9000`，
-> 程序读到就照用、**不会**静默改写成 https（只有文件里缺失该字段时才用新的 https 默认值）。
-> 服务端 9000 现在只收 https，所以请把 `endpoint` 手改成 `https://s3.example.com:9000`，或在界面上改端点后保存。
+> **Manual change needed when upgrading from older versions**: old `config.json` files store `http://…` in
+> `endpoint`; the program uses it as-is and does **not** silently rewrite it to https (the new https default
+> only applies when the field is missing). If your server only accepts https, change `endpoint` to the
+> `https://…` form manually, or edit the endpoint in the UI and save.
 
-## 开机自启
+## Start with Windows
 
-勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的字符串值 `s3fs-win`，内容
-`"<exe 绝对路径>" --min`；取消勾选就删除该值。写的是 HKCU，所以**不需要管理员**。
+When checked, the program writes a string value `s3fs-win` under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` containing `"<absolute exe path>" --min`;
+unchecking deletes it. It is HKCU, so **no admin rights needed**.
 
-注意语义是「当前用户**登录时**启动」而不是「开机时启动」，盘符也只对当前登录用户可见。
-要真正的开机无人值守，得用任务计划程序在「用户登录时」触发。
+Note the semantics: it starts at **user logon**, not at boot, and the drive letter is only visible to that
+user. For true unattended boot mounting, use Task Scheduler triggered "at log on".
 
-如果 `Run` 下已经存在同名但内容不同的值（比如另一个叫 s3fs-win 的程序），程序按「未启用」显示并在日志里提示，
-勾选后会被本程序的路径覆盖。
+If a value with the same name but different content already exists under `Run` (e.g. another program named
+s3fs-win), the program shows "disabled" and logs a hint; checking the box overwrites it with this program's path.
 
-## 命令行开关
+## Command-line switches
 
-| 开关 | 作用 |
+| Switch | Purpose |
 | --- | --- |
-| `--min` | 启动即进托盘，不弹主窗口（开机自启用的就是它） |
-| `--print-args` | 按当前 config.json 渲染将要执行的命令行后退出，并写 `s3fs-win.args.txt`（含逐项 ArgumentList） |
-| `--selftest` | 跑参数拼装自检（无窗口），全过退出码 0，并写 `s3fs-win.selftest.txt` |
-| `--probe-instance` | 诊断用：报告单实例互斥体是否已被别的进程持有（`S3FS_PROBE_HOLD=秒` 可占住不放） |
-| `-h` / `--help` | 帮助 |
+| `--min` | Start straight to the tray, no main window (used by autostart) |
+| `--print-args` | Render the command line for the current config.json and exit, writing `s3fs-win.args.txt` (including the per-item ArgumentList) |
+| `--selftest` | Run the argument-assembly self test (no window); exit code 0 when all pass, writes `s3fs-win.selftest.txt` |
+| `--probe-instance` | Diagnostic: report whether the single-instance mutex is held by another process (`S3FS_PROBE_HOLD=seconds` holds it) |
+| `-h` / `--help` | Help |
 
-单实例：命名互斥体 + 命名唤醒事件，都放在当前会话命名空间（每登录会话一个实例）。
-已有实例在跑时再双击 exe，只会把它的窗口唤起来。
+Single instance: a named mutex plus a named wakeup event, both in the current session namespace (one instance
+per logon session). Double-clicking the exe while an instance is running merely wakes its window.
 
-## 挂载成功怎么判的
+## How "mount succeeded" is decided
 
-不看单一信号，而是同时看三样：进程是否已退出、日志里有没有致命行
-（`FSD not found`、`not enough disk space`、`credentials`/`permission`/`signature`、
-`unknown third option`、`curlCode: 7` 等）、进程是否稳定存活 3 秒。
-命中致命行时，日志框里那行原样保留并追加中文提示；进程退出时把退出码打出来。
+No single signal; three things are checked together: whether the process exited, whether the log contains a
+fatal line (`FSD not found`, `not enough disk space`, `credentials`/`permission`/`signature`,
+`unknown third option`, `curlCode: 7`, etc.), and whether the process stays alive for 3 seconds.
+When a fatal line hits, it stays in the log pane with a hint appended; on exit the exit code is printed.
 
-## 常见报错
+## Common errors
 
-| 日志里的行 | 怎么办 |
+| Log line | What to do |
 | --- | --- |
-| `Cannot create WinFsp-FUSE file system: FSD not found.` | 没装 WinFsp，跑包里的 msi |
-| `There is not enough disk space … already has 0.000 MB.` | `tmpdir` 没给或给了相对路径/不存在的目录 |
-| `unexpected error from stat(C:Soft…)：No such file or directory` | 有反斜杠混进 `-o`（本程序已自动转正斜杠；手敲命令行时要注意） |
-| `specified unknown third option` | options 里有 1.97 不认识的选项（例：`readdir_optimize`） |
-| `credentials` / `signature` / `permission` | Access Key、Secret Key 或 region 不对 |
-| `curlCode: 7` | 端点连不上：URL、端口、防火墙 |
-| `server certificate verification failed` / `SSL: error` | 自签证书没跳过校验：确认命令行上有 `-o no_check_certificate`（本程序默认会加） |
-| 回 `400` / `Client sent an HTTP request to an HTTPS server` | 端点写成了 `http://`，本机 9000 只收 https |
-| 提示 Access Key / Secret Key 为空 | 程序不会代写凭据文件，直接去改文件；或把密钥填回界面 |
-| 盘符能进、资源管理器却报「拒绝访问」 | 先确认命令行上有 `-o umask=000`（本程序与 `mount.bat` 默认都带），见上面第 8 条 |
+| `Cannot create WinFsp-FUSE file system: FSD not found.` | WinFsp not installed; run the bundled MSI |
+| `There is not enough disk space … already has 0.000 MB.` | `tmpdir` missing, relative, or nonexistent |
+| `unexpected error from stat(C:Soft…): No such file or directory` | A backslash slipped into `-o` (this program converts to forward slashes automatically; beware when typing commands by hand) |
+| `specified unknown third option` | An option unknown to 1.97 in the options field (e.g. `readdir_optimize`) |
+| `credentials` / `signature` / `permission` | Wrong Access Key, Secret Key or region |
+| `curlCode: 7` | Endpoint unreachable: URL, port, firewall |
+| `server certificate verification failed` / `SSL: error` | Self-signed certificate without skipping verification: confirm `-o no_check_certificate` is on the command line (this program adds it by default) |
+| `400` / `Client sent an HTTP request to an HTTPS server` | Endpoint written as `http://` while the server only accepts https |
+| Prompt that Access Key / Secret Key are empty | The program will not write the credential file; edit the file directly, or fill the keys back in the UI |
+| Drive opens but Explorer says "Access denied" | First confirm `-o umask=000` is on the command line (both this program and `mount.bat` add it by default), see rule 8 above |
 
+Verified locally (Linux + wine-11.0):
 
-本机（Linux + wine-11.0）已验：
+- `dotnet build` / `dotnet publish` both exit 0; build has 0 warnings 0 errors; the publish directory has a single exe;
+- `--selftest` fully passes (forward-slash paths, same-option dedup with user priority, `no_check_certificate`
+  and `umask=000` each present exactly once, legacy `http` endpoints not rewritten, `readdir_optimize` removal,
+  relative tmpdir made absolute, argument list structure, config fault tolerance, registry read/write);
+- the rendered command line was fed to the bundled `s3fs.exe`: mime and credential paths accepted,
+  connecting to `url=https://s3.example.com:9000` shows no TLS/certificate errors and stops only at wine's
+  missing-driver `FSD not found` (consistent with the bundled INSTALL.md);
+- the GUI window stays up without crashing, single instance works (a second instance detects the first and
+  exits 0), `autoMountOnStart` really launches the `s3fs.exe` child, creates the tmp dir, and the
+  auto-written `passwd-s3fs` has no BOM.
 
-- `dotnet build` / `dotnet publish` 均退出码 0，build 0 警告 0 错误，publish 目录 1 个 exe；
-- `--selftest` 全部通过（含路径转正斜杠、同名选项去重与用户优先、`no_check_certificate` 与 `umask=000` 各自始终且只出现一次、
-  老配置的 `http` 端点不被改写、`readdir_optimize` 剔除、相对 tmpdir 绝对化、参数表结构、config 容错、注册表读写）；
-- 渲染出的命令行喂给包里的 `s3fs.exe`：mime 与凭据路径都被正常接受，走 `url=https://s3.example.com:9000`
-  实连服务端无 TLS/证书报错，只停在 wine 缺驱动的 `FSD not found`（与包内 INSTALL.md 的结论一致）；
-- GUI 窗口常驻不崩、单实例（第二个实例识别到已有实例并退出码 0）、`autoMountOnStart`
-  确实拉起 `s3fs.exe` 子进程并自动建好 tmp 目录、代写的 `passwd-s3fs` 无 BOM。
+## License
 
-## 许可
-
-本项目（GUI 源码、Windows 适配补丁、文档）以 **GPL-2.0-or-later** 分发，与上游 s3fs-fuse 一致；
-补丁部分派生自 [s3fs-fuse](https://github.com/s3fs-fuse/s3fs-fuse)（其版权归上游作者），完整许可文本见 [LICENSE](LICENSE)。
+This project (GUI source, Windows adaptation patch, documentation) is distributed under **GPL-2.0-or-later**,
+matching upstream s3fs-fuse; the patch is derived from
+[s3fs-fuse](https://github.com/s3fs-fuse/s3fs-fuse) (whose copyright belongs to the upstream authors).
+Full license text: [LICENSE](LICENSE).
