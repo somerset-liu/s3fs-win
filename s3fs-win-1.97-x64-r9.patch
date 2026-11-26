@@ -1,0 +1,3419 @@
+diff --git a/configure.ac b/configure.ac
+index 26aae3f..49044e2 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -19,7 +19,7 @@
+ ######################################################################
+ dnl Process this file with autoconf to produce a configure script.
+ 
+-AC_PREREQ([2.69])
++AC_PREREQ([2.72])
+ AC_INIT([s3fs],[1.97],[https://github.com/s3fs-fuse/s3fs-fuse/issues])
+ AC_CONFIG_HEADERS([config.h])
+ 
+@@ -83,11 +83,14 @@ CXXFLAGS="-Wall -fno-exceptions -D_FILE_OFFSET_BITS=64 $FORTIFY_FLAG -std=$CPP_V
+ dnl ----------------------------------------------
+ dnl For macOS
+ dnl ----------------------------------------------
++mingw_host=no
++
+ case "$host" in
+    *-cygwin* | *-mingw* | *-msys* )
+       # Do something specific for windows using winfsp
+       CXXFLAGS="$CXXFLAGS -D_GNU_SOURCE=1"
+       min_fuse_version=2.8
++      mingw_host=yes
+       ;;
+    *-darwin* )
+       # Mac requires libfuse3 from either FUSE-T (>= 1.2.0) or macFUSE (>= 5.0).
+@@ -296,6 +299,9 @@ AM_CONDITIONAL([USE_SSL_GNUTLS], [test "$auth_lib" = gnutls -o "$auth_lib" = net
+ AM_CONDITIONAL([USE_GNUTLS_NETTLE], [test "$auth_lib" = nettle])
+ AM_CONDITIONAL([USE_SSL_NSS], [test "$auth_lib" = nss])
+ 
++# Some of the test programs do not build on Windows(mingw), see test/Makefile.am
++AM_CONDITIONAL([MINGW_HOST], [test "$mingw_host" = yes])
++
+ dnl ----------------------------------------------
+ dnl check functions
+ dnl ----------------------------------------------
+@@ -332,7 +338,13 @@ AC_COMPILE_IFELSE(
+ dnl ----------------------------------------------
+ dnl dl library
+ dnl ----------------------------------------------
+-AC_SEARCH_LIBS([dlopen], [dl], [], [AC_MSG_ERROR([Could not find dlopen])])
++dnl [NOTE]
++dnl mingw-w64 has neither libdl nor <dlfcn.h>; s3fs_cred.cpp uses the small
++dnl loader shim in src/win_dlfcn.h instead(see also that file).
++dnl ----------------------------------------------
++if test "$mingw_host" != yes; then
++    AC_SEARCH_LIBS([dlopen], [dl], [], [AC_MSG_ERROR([Could not find dlopen])])
++fi
+ 
+ dnl ----------------------------------------------
+ dnl build date
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 62f2634..8593a35 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -77,10 +77,12 @@ noinst_PROGRAMS = \
+     test_cache_node \
+     test_cred_ibm \
+     test_curl_util \
++    test_dirhandle \
+     test_metaheader \
+     test_page_list \
+     test_s3objlist \
+-    test_string_util
++    test_string_util \
++    test_tmpfile
+ 
+ test_auth_SOURCES = \
+     common_auth.cpp \
+@@ -136,6 +138,14 @@ test_s3objlist_SOURCES = s3objlist.cpp test_s3objlist.cpp
+ 
+ test_string_util_SOURCES = string_util.cpp test_string_util.cpp s3fs_logger.cpp
+ 
++# The temporary file test needs nothing but the CRT: see the header comment of
++# src/test_tmpfile.cpp for what each platform side of it covers.
++test_tmpfile_SOURCES = test_tmpfile.cpp
++
++# Likewise nothing but the CRT: src/win_readdir.h is header only, see its
++# header comment and the one of src/test_dirhandle.cpp.
++test_dirhandle_SOURCES = test_dirhandle.cpp
++
+ test_metaheader_SOURCES = \
+     metaheader.cpp \
+     filetimes.cpp \
+@@ -148,14 +158,16 @@ TESTS = \
+     test_cache_node \
+     test_cred_ibm \
+     test_curl_util \
++    test_dirhandle \
+     test_metaheader \
+     test_page_list \
+     test_s3objlist \
+-    test_string_util
++    test_string_util \
++    test_tmpfile
+ 
+ clang-tidy:
+ 	clang-tidy -extra-arg-before=-xc++ -extra-arg=-std=@CPP_VERSION@ -header-filter= \
+-		*.h $(s3fs_SOURCES) test_auth.cpp test_cache_node.cpp test_cred_ibm.cpp test_curl_util.cpp test_metaheader.cpp test_page_list.cpp test_s3objlist.cpp test_string_util.cpp \
++		*.h $(s3fs_SOURCES) test_auth.cpp test_cache_node.cpp test_cred_ibm.cpp test_curl_util.cpp test_dirhandle.cpp test_metaheader.cpp test_page_list.cpp test_s3objlist.cpp test_string_util.cpp \
+ 		-- $(DEPS_CFLAGS) $(CPPFLAGS)
+ 
+ #
+diff --git a/src/addhead.h b/src/addhead.h
+index 0e01809..5196922 100644
+--- a/src/addhead.h
++++ b/src/addhead.h
+@@ -22,7 +22,11 @@
+ #define S3FS_ADDHEAD_H_
+ 
+ #include <memory>
++#ifdef __MSYS__
++#include "win_posix.h"      // mingw-w64 has no <regex.h>, see the regcomp() shim there
++#else
+ #include <regex.h>
++#endif
+ #include <string>
+ #include <utility>
+ #include <vector>
+diff --git a/src/common.h b/src/common.h
+index cb81c88..487b5ca 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -27,6 +27,12 @@
+ 
+ #include "../config.h"
+ 
++//
++// The POSIX layer for the Windows(mingw) build; empty on every other platform.
++// (It must come before the project headers, which use the types it defines.)
++//
++#include "win_posix.h"
++
+ //-------------------------------------------------------------------
+ // Global variables
+ //-------------------------------------------------------------------
+diff --git a/src/curl.h b/src/curl.h
+index 220357a..6210e21 100644
+--- a/src/curl.h
++++ b/src/curl.h
+@@ -23,6 +23,7 @@
+ 
+ #include <cstdint>
+ #include <curl/curl.h>
++#include "win_api_undef.h"      // the Win32 macros that collide with s3fs names
+ #include <map>
+ #include <memory>
+ #include <mutex>
+diff --git a/src/curl_share.h b/src/curl_share.h
+index d0e84dd..e04e007 100644
+--- a/src/curl_share.h
++++ b/src/curl_share.h
+@@ -22,6 +22,7 @@
+ #define S3FS_CURL_SHARE_H_
+ 
+ #include <curl/curl.h>
++#include "win_api_undef.h"      // the Win32 macros that collide with s3fs names
+ #include <map>
+ #include <memory>
+ #include <mutex>
+diff --git a/src/curl_util.h b/src/curl_util.h
+index 5f6d816..7e712a0 100644
+--- a/src/curl_util.h
++++ b/src/curl_util.h
+@@ -23,6 +23,7 @@
+ 
+ #include <cstdint>
+ #include <curl/curl.h>
++#include "win_api_undef.h"      // the Win32 macros that collide with s3fs names
+ #include <optional>
+ #include <string>
+ #include <string_view>
+diff --git a/src/fdcache.cpp b/src/fdcache.cpp
+index 2d91102..779ac52 100644
+--- a/src/fdcache.cpp
++++ b/src/fdcache.cpp
+@@ -29,7 +29,12 @@
+ #include <mutex>
+ #include <string>
+ #include <sys/stat.h>
++#ifdef __MSYS__
++// <sys/statvfs.h> does not exist on mingw-w64; win_posix.h supplies the types
++// and fuse_statvfs().
++#else
+ #include <sys/statvfs.h>
++#endif
+ #include <utility>
+ #include <vector>
+ 
+@@ -378,6 +383,43 @@ bool FdManager::HaveLseekHole()
+     return FdManager::have_lseek_hole;
+ }
+ 
++#ifdef __MSYS__
++//
++// Removes the temporary files a previous run left in tmp_dir.
++//
++// A temporary file is opened with _O_TEMPORARY(see s3fs_tempfile_unlinked()),
++// so Windows deletes it as soon as the last descriptor closes - even when the
++// process is killed.  Only a power failure, or an older build that could not
++// delete the file at all, leaves any behind, and those would pile up.
++//
++// [NOTE]
++// The result of unlink() is ignored on purpose: a file still held by another
++// running s3fs is in the Windows "delete pending" state and cannot be removed
++// here, which is not an error for us.
++//
++static void DeleteStaleTempFiles(const std::string& dir)
++{
++    static constexpr char TMPFILE_PREFIX[] = "s3fstmp.";
++
++    if(dir.empty()){
++        return;
++    }
++    DIR* dp;
++    if(nullptr == (dp = opendir(dir.c_str()))){
++        return;
++    }
++    for(const struct dirent* dent = readdir(dp); nullptr != dent; dent = readdir(dp)){
++        if(0 == strncmp(dent->d_name, TMPFILE_PREFIX, sizeof(TMPFILE_PREFIX) - 1)){
++            std::string fullpath = dir + "/" + dent->d_name;
++            if(0 == unlink(fullpath.c_str())){
++                S3FS_PRN_INFO("removed stale temporary file(%s).", fullpath.c_str());
++            }
++        }
++    }
++    closedir(dp);
++}
++#endif  // __MSYS__
++
+ bool FdManager::SetTmpDir(const char *dir)
+ {
+     if(!dir || '\0' == dir[0]){
+@@ -385,6 +427,9 @@ bool FdManager::SetTmpDir(const char *dir)
+     }else{
+         tmp_dir = dir;
+     }
++#ifdef __MSYS__
++    DeleteStaleTempFiles(tmp_dir);
++#endif
+     return true;
+ }
+ 
+@@ -423,11 +468,22 @@ std::unique_ptr<FILE, decltype(&s3fs_fclose)> FdManager::MakeTempFile() {
+         S3FS_PRN_ERR("failed to create tmp file. errno(%d)", errno);
+         return {nullptr, &s3fs_fclose};
+     }
++#ifdef __MSYS__
++    // The Windows CRT cannot unlink a file while a handle to it is open, so the
++    // unlink() below fails here with EACCES; s3fs_tempfile_unlinked()(see
++    // win_posix.h) reopens the file with _O_TEMPORARY instead, which deletes it
++    // when the descriptor is closed and leaves it usable until then.
++    if (-1 == (fd = s3fs_tempfile_unlinked(fd, cfn))) {
++        S3FS_PRN_ERR("failed to delete tmp file. errno(%d)", errno);
++        return {nullptr, &s3fs_fclose};
++    }
++#else
+     if (-1 == unlink(cfn)) {
+         S3FS_PRN_ERR("failed to delete tmp file. errno(%d)", errno);
+         close(fd);
+         return {nullptr, &s3fs_fclose};
+     }
++#endif
+     return {fdopen(fd, "rb+"), &s3fs_fclose};
+ }
+ 
+@@ -1111,7 +1167,7 @@ bool FdManager::RawCheckAllCache(FILE* fp, const char* cache_stat_top_dir, const
+ 
+             // open cache file
+             int cache_file_fd;
+-            if(-1 == (cache_file_fd = open(cache_path.c_str(), O_RDONLY))){
++            if(-1 == (cache_file_fd = s3fs_wopen(cache_path.c_str(), O_RDONLY))){
+                 ++err_file_cnt;
+                 S3FS_PRN_CACHE(fp, CACHEDBG_FMT_FILE_PROB, object_file_path.c_str(), strOpenedWarn.c_str());
+                 S3FS_PRN_CACHE(fp, CACHEDBG_FMT_CRIT_HEAD, "Could not open cache file");
+diff --git a/src/fdcache_entity.cpp b/src/fdcache_entity.cpp
+index e371cc5..f104026 100644
+--- a/src/fdcache_entity.cpp
++++ b/src/fdcache_entity.cpp
+@@ -338,7 +338,7 @@ int FdEntity::OpenMirrorFile()
+ 
+     // open mirror file
+     int mirrorfd;
+-    if(-1 == (mirrorfd = open(mirrorpath.c_str(), O_RDWR))){
++    if(-1 == (mirrorfd = s3fs_wopen(mirrorpath.c_str(), O_RDWR))){
+         S3FS_PRN_ERR("could not open mirror file(%s) by errno(%d).", mirrorpath.c_str(), errno);
+         return -errno;
+     }
+@@ -470,7 +470,7 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, const FileTimes& ts_times
+             pcfstat = std::make_unique<CacheFileStat>(path.c_str());
+ 
+             // try to open cache file
+-            if( -1 != (physical_fd = open(cachepath.c_str(), O_RDWR)) &&
++            if( -1 != (physical_fd = s3fs_wopen(cachepath.c_str(), O_RDWR)) &&
+                 0 != (inode = FdEntity::GetInode(physical_fd))        &&
+                 pagelist.Deserialize(*pcfstat, inode))
+             {
+@@ -513,7 +513,7 @@ int FdEntity::Open(const headers_t* pmeta, off_t size, const FileTimes& ts_times
+                 inode = 0;
+ 
+                 // could not open cache file or could not load stats data, so initialize it.
+-                if(-1 == (physical_fd = open(cachepath.c_str(), O_CREAT|O_RDWR|O_TRUNC, 0600))){
++                if(-1 == (physical_fd = s3fs_wopen(cachepath.c_str(), O_CREAT|O_RDWR|O_TRUNC, 0600))){
+                     int open_errno = errno;
+                     S3FS_PRN_ERR("failed to open file(%s). errno(%d)", cachepath.c_str(), open_errno);
+ 
+diff --git a/src/fdcache_stat.cpp b/src/fdcache_stat.cpp
+index 2679891..3dabfa9 100644
+--- a/src/fdcache_stat.cpp
++++ b/src/fdcache_stat.cpp
+@@ -250,12 +250,12 @@ bool CacheFileStat::RawOpen(bool readonly)
+     // open
+     int tmpfd;
+     if(readonly){
+-        if(-1 == (tmpfd = open(sfile_path.c_str(), O_RDONLY))){
++        if(-1 == (tmpfd = s3fs_wopen(sfile_path.c_str(), O_RDONLY))){
+             S3FS_PRN_ERR("failed to read only open cache stat file path(%s) - errno(%d)", path.c_str(), errno);
+             return false;
+         }
+     }else{
+-        if(-1 == (tmpfd = open(sfile_path.c_str(), O_CREAT|O_RDWR, 0600))){
++        if(-1 == (tmpfd = s3fs_wopen(sfile_path.c_str(), O_CREAT|O_RDWR, 0600))){
+             S3FS_PRN_ERR("failed to open cache stat file path(%s) - errno(%d)", path.c_str(), errno);
+             return false;
+         }
+diff --git a/src/filetimes.h b/src/filetimes.h
+index bf3c458..2d9411c 100644
+--- a/src/filetimes.h
++++ b/src/filetimes.h
+@@ -25,6 +25,8 @@
+ #include <string>
+ #include <sys/stat.h>
+ 
++#include "win_posix.h"      // the POSIX layer for the Windows(mingw) build
++
+ //-------------------------------------------------------------------
+ // Utility for stat time type
+ //-------------------------------------------------------------------
+diff --git a/src/metaheader.cpp b/src/metaheader.cpp
+index 9083aed..213d974 100644
+--- a/src/metaheader.cpp
++++ b/src/metaheader.cpp
+@@ -452,6 +452,13 @@ bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, s
+ {
+     stbuf = {};
+ 
++#ifdef _WIN32
++    // WinFsp turns st_ino into the Windows FileId(FileInfo->IndexNumber) and
++    // does not substitute a value of its own for 0, so hand it a stable
++    // non-zero one(see win_posix.h win_inode_from_path()).
++    stbuf.st_ino = win_inode_from_path(strpath.c_str());
++#endif
++
+     // set hard link count always 1
+     stbuf.st_nlink = 1; // see fuse FAQ
+ 
+diff --git a/src/s3fs.cpp b/src/s3fs.cpp
+index 71df16c..20d5b76 100644
+--- a/src/s3fs.cpp
++++ b/src/s3fs.cpp
+@@ -60,6 +60,7 @@
+ #include "s3fs_threadreqs.h"
+ #include "mpu_util.h"
+ #include "threadpoolman.h"
++#include "win_readdir.h"
+ 
+ //-------------------------------------------------------------------
+ // Symbols
+@@ -168,6 +169,9 @@ static int s3fs_fsync(const char* path, int datasync, struct fuse_file_info* fi)
+ static int s3fs_release(const char* path, struct fuse_file_info* fi);
+ static int s3fs_opendir(const char* path, struct fuse_file_info* fi);
+ static int s3fs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* info, enum fuse_readdir_flags);
++#ifdef __MSYS__
++static int s3fs_releasedir(const char* path, struct fuse_file_info* fi);
++#endif
+ static int s3fs_access(const char* path, int mask);
+ static void* s3fs_init(struct fuse_conn_info* conn, fuse_config* config);
+ static void s3fs_destroy(void*);
+@@ -293,6 +297,33 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
+     if(!path || '\0' == path[0]){
+         return -ENOENT;
+     }
++#ifdef __MSYS__
++    //
++    // Normalise the path once, here, for the whole function.
++    //
++    // Everything below keys off this string: the mount point test, the stat
++    // cache lookup, the HEAD request, the "dir/" and "dir_$folder$" overchecks
++    // and the stat cache key the result is stored under.  Those have to agree
++    // on one spelling or the cache never hits, so normalising only the request
++    // would leave the cache keyed by the unnormalised one.
++    //
++    // The bytes are logged because a backslash and a slash are otherwise
++    // indistinguishable in a log line that reads [path=\], which is exactly how
++    // this bug was found.  Seeing "\" here means the caller handed it over,
++    // seeing "/" means something below changed it.
++    //
++    S3FS_PRN_INFO("raw path [len=%zu][bytes=%s]", strlen(path), bytes_hex(path).c_str());
++    std::string nrmPath;                      // lives as long as path points at it
++    if(0 != strcmp(path, "//")){
++        // "//" is the bucket root request get_object_attribute() itself makes;
++        // normalising it would ask the server for a different object.
++        nrmPath = fuse_path_normalize(path);
++        if(0 != strcmp(path, nrmPath.c_str())){
++            S3FS_PRN_INFO("normalised path [from=%s][to=%s]", path, nrmPath.c_str());
++        }
++        path = nrmPath.c_str();
++    }
++#endif
+     strpath   = path;
+     pmeta     = pmeta ? pmeta : &tmpHead;
+     pstbuf    = pstbuf ? pstbuf : &tmpstbuf;
+@@ -314,6 +345,9 @@ static int get_object_attribute(const char* path, struct stat* pstbuf, headers_t
+         pstbuf->st_mode  = mp_mode;
+         pstbuf->st_uid   = is_s3fs_uid ? s3fs_uid : mp_uid;
+         pstbuf->st_gid   = is_s3fs_gid ? s3fs_gid : mp_gid;
++#ifdef _WIN32
++        pstbuf->st_ino   = win_inode_from_path(strpath.c_str());
++#endif
+     }
+ 
+     //
+@@ -3674,9 +3708,24 @@ static int s3fs_release(const char* _path, struct fuse_file_info* fi)
+ 
+ static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
+ {
++#ifdef __MSYS__
++    // [NOTE]
++    // Printed before the ESTALE early return below, and before anything else
++    // this callback does, so that a log from a machine where opendir() is not
++    // answered normally still shows exactly what WinFsp handed over.
++    //
++    S3FS_PRN_INFO("ENTER [path=%s][fi=%p][flags=0x%x][fh=%llu]",
++        (!_path ? "(null)" : ('\0' == _path[0] ? "(empty)" : _path)),
++        (void*)fi, (fi ? fi->flags : 0), (unsigned long long)(fi ? fi->fh : 0));
++
++    if(!_path || '\0' == _path[0]){
++        return -ESTALE;
++    }
++#else
+     if(!_path || '\0' == _path[0]){
+         return -ESTALE;
+     }
++#endif
+ 
+     WTF8_ENCODE(path)
+     int result;
+@@ -3688,9 +3737,42 @@ static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
+         result = check_parent_object_access(path, X_OK);
+     }
+ 
++#ifdef __MSYS__
++    // [NOTE]
++    // Remember which directory this handle is, so that s3fs_readdir() can
++    // recover the path when WinFsp passes none(it identifies the directory by
++    // the handle).  Only a successful opendir() gets a handle: a failed one is
++    // never followed by readdir() and must not look like an open directory.
++    //
++    if(0 == result && fi){
++        fi->fh = static_cast<uint64_t>(DirHandleMap::Get().Store(path));
++        S3FS_PRN_INFO("stored [path=%s][fh=%llu]", path, (unsigned long long)fi->fh);
++    }
++#endif
++
+     return result;
+ }
+ 
++#ifdef __MSYS__
++// [NOTE]
++// The upstream operation table has no releasedir callback because s3fs keeps no
++// directory state.  The Windows build registers one to return the handle that
++// s3fs_opendir() stored, and it must tolerate being called twice for the same
++// handle or not at all - WinFsp promises neither.
++//
++static int s3fs_releasedir(const char* _path, struct fuse_file_info* fi)
++{
++    S3FS_PRN_INFO("ENTER [path=%s][fi=%p][fh=%llu]",
++        (!_path ? "(null)" : ('\0' == _path[0] ? "(empty)" : _path)),
++        (void*)fi, (unsigned long long)(fi ? fi->fh : 0));
++
++    if(fi){
++        DirHandleMap::Get().Erase(static_cast<uint64_t>(fi->fh));
++    }
++    return 0;
++}
++#endif
++
+ // [NOTE]
+ // strpath must end with '/'.
+ //
+@@ -3725,6 +3807,14 @@ static int readdir_multi_head(const std::string& strpath, const S3ObjList& head,
+     s3obj_list_t notfound_list;
+ 
+     // Make single head request(with max).
++#ifdef __MSYS__
++    // [NOTE]
++    // Counters for the summary below: an entry that hits the Stat Cache is
++    // filled here and never asked about, so a listing whose HEAD requests are
++    // fewer than its entries is not necessarily a listing that stopped early.
++    //
++    std::size_t cache_hits = 0;
++#endif
+     for(const auto& [path, objtype] : headmap){
+         std::string disppath = strpath + path;
+         std::string etag     = head.GetETag(path.c_str());
+@@ -3739,6 +3829,9 @@ static int readdir_multi_head(const std::string& strpath, const S3ObjList& head,
+                 bpath = s3fs_wtf8_decode(bpath);
+             }
+             syncfiller.Fill(bpath, &st);
++#ifdef __MSYS__
++            ++cache_hits;
++#endif
+             continue;
+         }
+ 
+@@ -3750,11 +3843,26 @@ static int readdir_multi_head(const std::string& strpath, const S3ObjList& head,
+             // hold pointers to stack-local multi_head_sem/thparam_lock/
+             // syncfiller/retrycount/req_result/notfound_list. Record the
+             // failure and break to the drain loop below.
++            //
++#ifdef __MSYS__
++            S3FS_PRN_INFO("stopped asking at [entry=%s] after %d Head Requests: scheduling failed(%d)",
++                disppath.c_str(), req_count, result);
++#endif
+             sched_result = result;
+             break;
+         }
+         ++req_count;
+     }
++#ifdef __MSYS__
++    // [NOTE]
++    // One line that answers "why are there fewer Head Requests than entries":
++    // entries = what the LIST returned plus the children the Stat Cache knows,
++    // cache hits = filled without asking, head requests = actually asked about.
++    // entries == cache hits + head requests means the loop ran to its end.
++    //
++    S3FS_PRN_INFO("[path=%s][entries=%zu][cache hits=%zu][head requests=%d][not found=%zu][sched_result=%d]",
++        strpath.c_str(), headmap.size(), cache_hits, req_count, notfound_list.size(), sched_result);
++#endif
+ 
+     // wait for finish all requests
+     while(req_count > 0){
+@@ -3831,6 +3939,37 @@ static int readdir_multi_head(const std::string& strpath, const S3ObjList& head,
+ 
+ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* info, enum fuse_readdir_flags)
+ {
++#ifdef __MSYS__
++    // [NOTE]
++    // Printed before the ESTALE early return below, and before anything else
++    // this callback does, so that a log from a machine where readdir() is not
++    // answered normally still shows exactly what WinFsp handed over.
++    //
++    S3FS_PRN_INFO("ENTER [path=%s][buf=%p][filler=%p][info=%p][offset=%lld][fh=%llu]",
++        (!_path ? "(null)" : ('\0' == _path[0] ? "(empty)" : _path)), buf,
++        filler, (void*)info, (long long)offset,
++        (unsigned long long)(info ? info->fh : 0));
++
++    // [NOTE]
++    // Upstream returns ESTALE here: FUSE passes a null or empty path for a
++    // directory that was removed while it is still open, and s3fs keeps no
++    // directory handle to ask about it.  WinFsp does the same for every
++    // readdir() - it names the directory by fi->fh - so upstream reads "end of
++    // directory" on the first call and the mount point lists nothing but "."
++    // and "..".  Ask the handle table for the path opendir() saw first, and
++    // only give up when that misses too(see win_readdir.h).
++    //
++    std::string dirpath = resolve_dir_path(_path, (info ? static_cast<uint64_t>(info->fh) : 0));
++    if(dirpath.empty()){
++        S3FS_PRN_INFO("no path and no handle to recover it from, returns ESTALE");
++        return -ESTALE;
++    }
++    if(!_path || 0 != strcmp(_path, dirpath.c_str())){
++        S3FS_PRN_INFO("recovered [path=%s] from [fh=%llu]", dirpath.c_str(),
++            (unsigned long long)(info ? info->fh : 0));
++    }
++    _path = dirpath.c_str();
++#else
+     // [NOTE]
+     // FUSE passes a null path for a directory which was removed while
+     // it is still open.  s3fs does not keep a directory handle, so this
+@@ -3839,6 +3978,7 @@ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, of
+     if(!_path || '\0' == _path[0]){
+         return -ESTALE;
+     }
++#endif
+ 
+     WTF8_ENCODE(path)
+     S3ObjList head;
+@@ -3886,8 +4026,23 @@ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, of
+     }
+ 
+     // force to add "." and ".." name.
++#ifdef __MSYS__
++    // [NOTE]
++    // The return value is printed, not ignored: a filler that answers non-zero
++    // has taken the entry and is telling the callback to stop.  WinFsp is free
++    // to be stricter about that than the Linux kernel, and if it is, everything
++    // after the first refusal is missing from the listing.
++    //
++    {
++        int dot_result = filler(buf, ".", nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS);
++        S3FS_PRN_INFO("filler [entry=.][stat=no][rc=%d]", dot_result);
++        int dotdot_result = filler(buf, "..", nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS);
++        S3FS_PRN_INFO("filler [entry=..][stat=no][rc=%d]", dotdot_result);
++    }
++#else
+     filler(buf, ".", nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS);
+     filler(buf, "..", nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS);
++#endif
+     if(head.IsEmpty()){
+         return 0;
+     }
+@@ -4379,8 +4534,10 @@ static int s3fs_setxattr(const char* _path, const char* name, const char* value,
+     return 0;
+ }
+ 
+-static int s3fs_getxattr(const char* path, const char* name, char* value, size_t size)
++static int s3fs_getxattr(const char* _path, const char* name, char* value, size_t size)
+ {
++    FUSE_PATH_NORMALIZE(path)
++
+     FUSE_CTX_DBG("[path=%s][name=%s][value=%p][size=%zu]", path, name, value, size);
+ 
+     if(!path || !name){
+@@ -4436,8 +4593,10 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
+     return static_cast<int>(length);
+ }
+ 
+-static int s3fs_listxattr(const char* path, char* list, size_t size)
++static int s3fs_listxattr(const char* _path, char* list, size_t size)
+ {
++    FUSE_PATH_NORMALIZE(path)
++
+     S3FS_PRN_INFO("[path=%s][list=%p][size=%zu]", path, list, size);
+ 
+     if(!path){
+@@ -4779,8 +4938,10 @@ static void s3fs_destroy(void*)
+     }
+ }
+ 
+-static int s3fs_access(const char* path, int mask)
++static int s3fs_access(const char* _path, int mask)
+ {
++    FUSE_PATH_NORMALIZE(path)
++
+     if(!path || '\0' == path[0]){
+         return -ESTALE;
+     }
+@@ -6425,6 +6586,9 @@ int main(int argc, char* argv[])
+     s3fs_oper.release     = s3fs_release;
+     s3fs_oper.opendir     = s3fs_opendir;
+     s3fs_oper.readdir     = s3fs_readdir;
++#ifdef __MSYS__
++    s3fs_oper.releasedir  = s3fs_releasedir;
++#endif
+     s3fs_oper.init        = s3fs_init;
+     s3fs_oper.destroy     = s3fs_destroy;
+     s3fs_oper.access      = s3fs_access;
+diff --git a/src/s3fs_cred.cpp b/src/s3fs_cred.cpp
+index 652bfb4..4b844a7 100644
+--- a/src/s3fs_cred.cpp
++++ b/src/s3fs_cred.cpp
+@@ -21,9 +21,17 @@
+ #include <cstring>
+ #include <cerrno>
+ #include <unistd.h>
++#ifdef __MSYS__
++#include "win_posix.h"                          // mingw-w64 has no <pwd.h>
++#else
+ #include <pwd.h>
++#endif
+ #include <sys/stat.h>
++#ifdef __MSYS__
++#include "win_dlfcn.h"                     // mingw-w64 has no <dlfcn.h>
++#else
+ #include <dlfcn.h>
++#endif
+ #include <fstream>
+ #include <mutex>
+ #include <sstream>
+@@ -588,6 +596,14 @@ bool S3fsCred::CheckS3fsPasswdFilePerms()
+         return false;
+     }
+ 
++// The permission checks below read the POSIX bits of st_mode, but on Windows
++// mingw's stat() synthesises them from the file attributes only(the result is
++// always 0666 before the umask): the real ACL lives in NTFS and is not
++// expressed in st_mode.  So every passwd file would look world readable.
++#ifdef __MSYS__
++    S3FS_PRN_INFO("Skipping permission check for %s on Windows; NTFS ACL not expressed in st_mode.", passwd_file.c_str());
++    return true;
++#else
+     // return error if any file has others permissions
+     if( (info.st_mode & S_IROTH) ||
+         (info.st_mode & S_IWOTH) ||
+@@ -617,6 +633,7 @@ bool S3fsCred::CheckS3fsPasswdFilePerms()
+         return false;
+     }
+     return true;
++#endif
+ }
+ 
+ //
+diff --git a/src/s3fs_cred_ibm.h b/src/s3fs_cred_ibm.h
+index 799169d..791eb11 100644
+--- a/src/s3fs_cred_ibm.h
++++ b/src/s3fs_cred_ibm.h
+@@ -23,6 +23,7 @@
+ 
+ #include <ctime>
+ #include <curl/curl.h>
++#include "win_api_undef.h"      // the Win32 macros that collide with s3fs names
+ #include <string>
+ 
+ #include "types.h"
+diff --git a/src/s3fs_logger.h b/src/s3fs_logger.h
+index 1ed0463..2e34d9f 100644
+--- a/src/s3fs_logger.h
++++ b/src/s3fs_logger.h
+@@ -24,10 +24,20 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <string>
++#ifdef __MSYS__
++#include "win_syslog.h"                       // mingw-w64 has no <syslog.h>
++#else
+ #include <syslog.h>
++#endif
+ 
+ #include "common.h"  // NOLINT(misc-include-cleaner)
+ 
++#ifdef __MSYS__
++// <windows.h>(winbase.h) #defines GetCurrentTime to GetTickCount, which would
++// swallow the method name below.
++#undef GetCurrentTime
++#endif
++
+ #ifdef CLOCK_MONOTONIC_COARSE
+ #define S3FS_CLOCK_MONOTONIC    CLOCK_MONOTONIC_COARSE
+ #else
+diff --git a/src/s3fs_threadreqs.cpp b/src/s3fs_threadreqs.cpp
+index 0bd8655..35a3352 100644
+--- a/src/s3fs_threadreqs.cpp
++++ b/src/s3fs_threadreqs.cpp
+@@ -28,6 +28,7 @@
+ #include "s3fs_xml.h"
+ #include "cache.h"
+ #include "string_util.h"
++#include "win_readdir.h"
+ 
+ //-------------------------------------------------------------------
+ // Thread Worker functions for MultiThread Request
+@@ -53,6 +54,35 @@ void* head_req_threadworker(S3fsCurl& s3fscurl, void* arg)
+ //
+ // Thread Worker function for multi head request
+ //
++#ifdef __MSYS__
++// [NOTE]
++// Put an entry that this thread could not ask the server about into the
++// listing anyway, with a placeholder stat(see win_readdir.h).
++//
++// Upstream fills an entry only when the HEAD request answered 2xx, and records
++// a 404 for the caller to look up as a possible path without an object.  Every
++// other answer - 400, 403, 500 after the retries, a transport error - just
++// leaves the loop, so the object is silently dropped from readdir().  When that
++// happens to every child of a directory, the directory lists nothing at all
++// even though the LIST request that produced it succeeded.
++//
++// A 404 is deliberately not handled here: the caller has a cheaper and more
++// accurate answer for it(directory_empty()).
++//
++static void fill_failed_head_entry(const multi_head_req_thparam& thparam)
++{
++    std::string bpath = mybasename(thparam.path);
++    if(thparam.use_wtf8){
++        bpath = s3fs_wtf8_decode(bpath);
++    }
++
++    struct stat stbuf = make_fallback_stat(IS_DIR_OBJ(thparam.objtype));
++    thparam.psyncfiller->Fill(bpath, &stbuf);
++
++    S3FS_PRN_INFO("listed [entry=%s] with a placeholder stat because its Head Request did not answer", bpath.c_str());
++}
++#endif
++
+ void* multi_head_req_threadworker(S3fsCurl& s3fscurl, void* arg)
+ {
+     std::unique_ptr<multi_head_req_thparam> pthparam(static_cast<multi_head_req_thparam*>(arg));
+@@ -77,6 +107,9 @@ void* multi_head_req_threadworker(S3fsCurl& s3fscurl, void* arg)
+             responseCode = *rc;
+         }else{
+             result = -EIO;
++#ifdef __MSYS__
++            fill_failed_head_entry(*pthparam);
++#endif
+             break;
+         }
+ 
+@@ -179,6 +212,11 @@ void* multi_head_req_threadworker(S3fsCurl& s3fscurl, void* arg)
+                 if(0 == result){
+                     result = -EIO;
+                 }
++#ifdef __MSYS__
++                // The filler has a lock of its own and nothing takes the one
++                // held here while holding that one, so filling is safe.
++                fill_failed_head_entry(*pthparam);
++#endif
+                 break;
+             }
+         }
+diff --git a/src/s3fs_util.cpp b/src/s3fs_util.cpp
+index fe725a7..ba3a946 100644
+--- a/src/s3fs_util.cpp
++++ b/src/s3fs_util.cpp
+@@ -23,10 +23,18 @@
+ #include <cstring>
+ #include <unistd.h>
+ #include <cerrno>
++#ifdef __MSYS__
++#include "win_posix.h"                          // mingw-w64 has no <grp.h> / <pwd.h>
++#else
+ #include <grp.h>
++#endif
+ #include <memory>
+ #include <mutex>
++#ifdef __MSYS__
++// <pwd.h> already replaced by win_posix.h above
++#else
+ #include <pwd.h>
++#endif
+ #include <libgen.h>
+ #include <dirent.h>
+ #include <sys/stat.h>
+@@ -56,6 +64,21 @@ static size_t max_group_name_length;
+ std::string get_realpath(const char *path)
+ {
+     std::string realpath = mount_prefix;
++#ifdef __MSYS__
++    // [NOTE]
++    // Every object key of every request the Windows build sends is built here
++    // (MakeUrlResource(get_realpath(tpath)) and the x-amz-copy-source header),
++    // so this is the one place that catches a path which still carries a
++    // backslash because it came from a helper the FUSE callbacks never saw -
++    // mydirname() before r7 answered dirname("/server.csv") with "\".
++    // The bucket root spelling "//" is kept, see fuse_request_path_normalize().
++    // An empty path is left alone, as upstream.
++    //
++    if(path && '\0' != path[0]){
++        realpath += fuse_request_path_normalize(path);
++        return realpath;
++    }
++#endif
+     realpath += path;
+ 
+     return realpath;
+@@ -171,13 +194,31 @@ int is_uid_include_group(uid_t uid, gid_t gid)
+ // where dirname didn't receive its return value correctly due to thread
+ // conflicts.
+ // To avoid this, exclusive control is performed by mutex.
++// [NOTE]
++// The Windows build does not call those C library functions at all(see
++// posix_dirname()/posix_basename()), so the mutex is only needed elsewhere.
+ //
++#ifndef __MSYS__
+ static std::mutex basename_lock;
++#endif
+ 
+ // safe variant of dirname
+ // dirname clobbers path so let it operate on a tmp copy
+ std::string mydirname(std::string path)
+ {
++#ifdef __MSYS__
++    // [NOTE]
++    // Not dirname() here.  On Windows that is the MSVCRT one, and it answers
++    // "\" to dirname("/server.csv") where glibc answers "/" - see
++    // posix_dirname() in string_util.h for what that costs: the "\" goes out as
++    // a HEAD request(the server answers 403) and check_parent_object_access(),
++    // which loops until its parent equals "/", never matches it.
++    //
++    if(path.empty()){
++        return "";
++    }
++    return posix_dirname(path);
++#else
+     const std::lock_guard<std::mutex> lock(basename_lock);
+ 
+     if(path.empty()){
+@@ -186,12 +227,24 @@ std::string mydirname(std::string path)
+ 
+     path.push_back('\0');     // terminate with a null character and allocate space for it.
+     return dirname(path.data());
++#endif
+ }
+ 
+ // safe variant of basename
+ // basename clobbers path so let it operate on a tmp copy
+ std::string mybasename(std::string path)
+ {
++#ifdef __MSYS__
++    // [NOTE]
++    // Same reason as mydirname(): the MSVCRT basename() answers "\" to
++    // basename("/"), and this value goes straight to the readdir filler as an
++    // entry name.  For every other name s3fs lists the two agree.
++    //
++    if(path.empty()){
++        return "";
++    }
++    return posix_basename(path);
++#else
+     const std::lock_guard<std::mutex> data_lock(basename_lock);
+ 
+     if(path.empty()){
+@@ -200,6 +253,7 @@ std::string mybasename(std::string path)
+ 
+     path.push_back('\0');      // terminate with a null character and allocate space for it.
+     return basename(path.data());
++#endif
+ }
+ 
+ // mkdir --parents
+@@ -208,9 +262,45 @@ int mkdirp(const std::string& path, mode_t mode)
+     std::string        base;
+     std::string        component;
+     std::istringstream ss(path);
++#ifdef _WIN32
++    // "C:/dir/..." : the drive root always exists, and mkdir() on it fails
++    // with EACCES on Windows, which would abort the whole walk and make the
++    // cache directory unusable.  Skip that first component.
++    bool skip_root = (3 <= path.size() &&
++                      (('A' <= path[0] && path[0] <= 'Z') || ('a' <= path[0] && path[0] <= 'z')) &&
++                      ':' == path[1] && ('/' == path[2] || '\\' == path[2]));
++#endif
+     while (getline(ss, component, '/')) {
+         base += component + "/";
+ 
++#ifdef _WIN32
++        if(skip_root){
++            skip_root = false;
++            continue;
++        }
++        // Windows: _stat64() rejects a trailing separator with ENOENT, so
++        // hand mkdir()/lstat() the path without it.
++        std::string mkpath = base;
++        while(1 < mkpath.size() && '/' == mkpath[mkpath.size() - 1]){
++            mkpath.erase(mkpath.size() - 1);
++        }
++        if(0 != mkdir(mkpath.c_str(), mode)){
++            int mterr = errno;
++            struct stat st;
++            if(EEXIST == mterr){
++                if(0 != lstat(mkpath.c_str(), &st) || !S_ISDIR(st.st_mode)){
++                    return -EPERM;
++                }
++                continue;
++            }
++            // Some CRTs report an odd errno for an existing directory; a
++            // successful directory stat means the same thing.
++            if(0 == lstat(mkpath.c_str(), &st) && S_ISDIR(st.st_mode)){
++                continue;
++            }
++            return -mterr;
++        }
++#else
+         if(0 != mkdir(base.c_str(), mode)){
+             if(errno == EEXIST){
+                 struct stat st;
+@@ -221,6 +311,7 @@ int mkdirp(const std::string& path, mode_t mode)
+                 return -errno;
+             }
+         }
++#endif
+     }
+     return 0;
+ }
+diff --git a/src/string_util.h b/src/string_util.h
+index 05f9eba..b06cea9 100644
+--- a/src/string_util.h
++++ b/src/string_util.h
+@@ -53,16 +53,224 @@ private:
+ constexpr bool is_prefix(std::string_view str, std::string_view prefix) { return str.substr(0, prefix.size()) == prefix; }
+ constexpr const char* SAFESTRPTR(const char *strptr) { return strptr ? strptr : ""; }
+ 
++//
++// Normalise a path coming from the FUSE layer.
++//
++// This is only used by the Windows(WinFsp) build, see the WTF8_ENCODE macro
++// below, but it is compiled on every platform so that it can be unit tested.
++//
++// WinFsp hands some paths to its FUSE3 compatibility layer in Windows form:
++// the root arrives as "\" (or ".") and the separators may be backslashes.
++// s3fs uses that string as an object key as-is, so it sends "HEAD \" which an
++// S3 server answers with 403; s3fs turns that into EPERM and WinFsp shows
++// "access denied" for the whole mount point.
++//
++// The rules are:
++//   1) every '\' is replaced by '/'
++//   2) repeated separators are collapsed
++//      ("//" is not lost: get_object_attribute() makes it from "/" itself, and
++//       fuse_request_path_normalize() below keeps it on its way to the server)
++//   3) a path without its leading separator gets one
++//   4) the spellings of the root("" , ".", "/", "\", "\.", "/.", "./") all
++//      become "/", so that get_object_attribute() recognises the mount point
++//      and "/dir/." becomes "/dir"
++//      (".." is left alone, it is a real name and not a root spelling)
++//
++inline std::string fuse_path_normalize(const char* path)
++{
++    if(!path){
++        return "/";
++    }
++
++    std::string strPath;
++    for(const char* p = path; '\0' != *p; ++p){
++        if('/' == *p || '\\' == *p){
++            if(strPath.empty() || '/' != strPath.back()){
++                strPath += '/';
++            }
++        }else{
++            strPath += *p;
++        }
++    }
++    if(strPath.empty() || '/' != strPath.front()){
++        strPath.insert(strPath.begin(), '/');
++    }
++
++    // Drop the separators and look at what is left to find the root spellings.
++    std::string body;
++    for(char c : strPath){
++        if('/' != c){
++            body += c;
++        }
++    }
++    if(body.empty() || "." == body){
++        return "/";
++    }
++
++    // "/dir/." is the same object as "/dir"("/." is the root, handled above).
++    if(4 <= strPath.size() && 0 == strPath.compare(strPath.size() - 2, 2, "/.")){
++        strPath.erase(strPath.size() - 2);
++    }
++    return strPath;
++}
++
++//
++// Normalise a path that is about to become an object key in a request.
++//
++// Same as fuse_path_normalize(), except that the one spelling upstream uses to
++// ask for the object named "/" at the bucket root - "//", which produces the
++// request "HEAD // HTTP/1.1" - is kept exactly as it is.  Collapsing it would
++// silently turn that request into a request for the object named "" instead,
++// which is a different object(and a different answer from the server).
++//
++// Like fuse_path_normalize(), this is compiled on every platform so that it can
++// be unit tested; only the Windows call sites use it.
++//
++inline std::string fuse_request_path_normalize(const char* path)
++{
++    if(!path){
++        return "/";
++    }
++    if('/' == path[0] && '/' == path[1] && '\0' == path[2]){
++        return "//";              // the bucket root request, see above
++    }
++    return fuse_path_normalize(path);
++}
++
+ //-------------------------------------------------------------------
+-// Macros(WTF8)
++// POSIX path components
+ //-------------------------------------------------------------------
+-#define WTF8_ENCODE(ARG)  \
+-        std::string ARG##_buf; \
+-        const char * ARG = _##ARG; \
+-        if (use_wtf8 && s3fs_wtf8_encode( _##ARG, 0 )) { \
+-            s3fs_wtf8_encode( _##ARG, &ARG##_buf); \
+-            ARG = ARG##_buf.c_str(); \
++//
++// The two helpers below replace the C library's dirname() and basename() for
++// the paths s3fs handles itself.
++//
++// They exist because the two C library implementations disagree: for
++// dirname("/server.csv") glibc answers "/" and the MSVCRT one that mingw's
++// dirname() forwards to answers "\"(a drive-relative root).  Used as an object
++// path, that "\" is a request for an object named "\", which an S3 server
++// answers with 403; worse, check_parent_object_access() loops comparing its
++// parent with "/", so it never terminates on a match.
++//
++// Both separators are accepted here, so the same code still works on the local
++// cache paths of a Windows build(ex. "C:\cache\file1/dir").  The results for
++// those are the same as the MSVCRT ones, which is why switching to these
++// helpers does not change what the cache directory looks like.
++//
++// One deviation from glibc, chosen deliberately: a path of nothing but
++// separators returns "/" where glibc returns the separators it was given
++// (dirname("//") is "//").  Such a path never reaches these helpers in s3fs -
++// fuse_path_normalize() collapses it first - and "/" is the answer callers
++// compare against.
++//
++constexpr bool is_path_separator(char c) { return '/' == c || '\\' == c; }
++
++//
++// The directory holding path, with the POSIX rules(glibc included).
++//
++inline std::string posix_dirname(std::string_view path)
++{
++    if(path.empty()){
++        return ".";
++    }
++    // The separators at the end belong to no component, so ignore them.
++    std::string_view::size_type last = path.size();
++    while(1 < last && is_path_separator(path[last - 1])){
++        --last;
++    }
++    // The separator in front of the last component is where the parent ends.
++    for(std::string_view::size_type i = last; 0 < i--; ){
++        if(is_path_separator(path[i])){
++            if(0 == i){
++                return "/";                       // "/file" is under the root
++            }
++            return std::string(path.substr(0, i));
++        }
++    }
++    return ".";                                   // "file" has no parent
++}
++
++//
++// The last component of path, with the POSIX rules(glibc included).
++//
++inline std::string posix_basename(std::string_view path)
++{
++    if(path.empty()){
++        return ".";
++    }
++    std::string_view::size_type last = path.size();
++    while(1 < last && is_path_separator(path[last - 1])){
++        --last;
++    }
++    for(std::string_view::size_type i = last; 0 < i--; ){
++        if(is_path_separator(path[i])){
++            if(i + 1 == last){
++                return "/";                       // "/" and "//" are the root
++            }
++            return std::string(path.substr(i + 1, last - i - 1));
++        }
++    }
++    return std::string(path.substr(0, last));     // no separator: the name itself
++}
++
++//
++// The bytes of a string as lower case hex, separated by spaces.
++//
++// Used by the Windows build to log a path exactly as it arrived: a backslash
++// and a slash are indistinguishable in a log line that reads "\", so the bytes
++// have to be spelled out.
++//
++inline std::string bytes_hex(std::string_view bytes)
++{
++    static constexpr char DIGITS[] = "0123456789abcdef";
++
++    std::string strHex;
++    strHex.reserve(3 * bytes.size());
++    for(char c : bytes){
++        if(!strHex.empty()){
++            strHex += ' ';
+         }
++        const unsigned char byte = static_cast<unsigned char>(c);
++        strHex += DIGITS[byte >> 4];
++        strHex += DIGITS[byte & 0x0f];
++    }
++    return strHex;
++}
++
++//-------------------------------------------------------------------
++// Macros(WTF8)
++//-------------------------------------------------------------------
++#ifdef __MSYS__
++    // [NOTE]
++    // The path is normalised before anything else looks at it, so that every
++    // FUSE callback sees the same "/" separated form it would see on Linux.
++    #define WTF8_ENCODE(ARG)  \
++            std::string ARG##_buf; \
++            std::string ARG##_nrm = fuse_path_normalize(_##ARG); \
++            const char * ARG = ARG##_nrm.c_str(); \
++            if (use_wtf8 && s3fs_wtf8_encode( ARG, 0 )) { \
++                s3fs_wtf8_encode( ARG, &ARG##_buf); \
++                ARG = ARG##_buf.c_str(); \
++            }
++
++    // [NOTE]
++    // Same normalisation, for the few FUSE callbacks that do not use the
++    // WTF8_ENCODE() macro(they do not need the WTF-8 decoding).
++    #define FUSE_PATH_NORMALIZE(ARG)  \
++            std::string ARG##_nrm = fuse_path_normalize(_##ARG); \
++            const char * ARG = ARG##_nrm.c_str();
++#else
++    #define WTF8_ENCODE(ARG)  \
++            std::string ARG##_buf; \
++            const char * ARG = _##ARG; \
++            if (use_wtf8 && s3fs_wtf8_encode( _##ARG, 0 )) { \
++                s3fs_wtf8_encode( _##ARG, &ARG##_buf); \
++                ARG = ARG##_buf.c_str(); \
++            }
++
++    // No normalisation on the other platforms: the path is used as it is.
++    #define FUSE_PATH_NORMALIZE(ARG)  \
++            const char * ARG = _##ARG;
++#endif
+ 
+ //-------------------------------------------------------------------
+ // Utilities
+diff --git a/src/syncfiller.cpp b/src/syncfiller.cpp
+index 9b70184..0ef2d4c 100644
+--- a/src/syncfiller.cpp
++++ b/src/syncfiller.cpp
+@@ -64,7 +64,18 @@ int SyncFiller::Flush()
+ 
+     for(const auto& [name, st] : entries){
+         // The non-seekable readdir filler only fails when it cannot allocate memory.
+-        if(0 != filler_func(filler_buff, name.c_str(), st.has_value() ? &st.value() : nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS)){
++        int result = filler_func(filler_buff, name.c_str(), st.has_value() ? &st.value() : nullptr, 0, S3FS_FUSE_FILL_DIR_DEFAULTS);
++#ifdef __MSYS__
++        // [NOTE]
++        // One line per entry, with the value the filler answered.  WinFsp hands
++        // this callback a buffer of its own and is not documented to behave like
++        // libfuse, so "which entries did it take and what did it say" has to be
++        // readable from a log rather than guessed: a non-zero answer here makes
++        // the whole listing fail with ENOMEM below.
++        //
++        S3FS_PRN_INFO("filler [entry=%s][stat=%s][rc=%d]", name.c_str(), st.has_value() ? "yes" : "no", result);
++#endif
++        if(0 != result){
+             return -ENOMEM;
+         }
+     }
+diff --git a/src/test_dirhandle.cpp b/src/test_dirhandle.cpp
+new file mode 100644
+index 0000000..b2bb260
+--- /dev/null
++++ b/src/test_dirhandle.cpp
+@@ -0,0 +1,241 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Randy Rizun <rrozse@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++//
++// Tests the readdir helpers of src/win_readdir.h: the directory handle table
++// that s3fs_opendir() fills and s3fs_readdir() reads, and the placeholder stat
++// that an entry gets when its HEAD request did not answer.
++//
++// The helpers are compiled on every platform - only their call sites are
++// inside #ifdef __MSYS__ - so this test says the same thing on both sides:
++// run it natively and, for the Windows target, under wine.
++//
++
++#include <cstdio>
++#include <cstring>
++#include <cerrno>
++#include <string>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include "win_readdir.h"
++
++#define ASSERT(cond)                                                                            \
++    do {                                                                                        \
++        if(!(cond)){                                                                            \
++            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);               \
++            std::fflush(stderr);                                                                \
++            return 1;                                                                           \
++        }                                                                                       \
++    } while(0)
++
++// A handle of 0 means "no handle", so it must never be handed out and never
++// resolve, and a stored path must come back unchanged.
++static int test_store_find_erase()
++{
++    DirHandleMap& map = DirHandleMap::Get();
++    map.Clear();
++
++    std::uint64_t root = map.Store("/");
++    std::uint64_t dir  = map.Store("/harbor-deploy");
++
++    ASSERT(0 != root);
++    ASSERT(root != dir);
++    ASSERT(map.Count() == 2);
++
++    std::string path;
++    ASSERT(map.Find(root, path));
++    ASSERT(path == "/");
++    ASSERT(map.Find(dir, path));
++    ASSERT(path == "/harbor-deploy");
++
++    // Find copies out, so a caller can never hold on into the table.
++    path = "changed";
++    ASSERT(map.Find(dir, path));
++    ASSERT(path == "/harbor-deploy");
++
++    ASSERT(map.Erase(dir));
++    ASSERT(!map.Find(dir, path));
++    // WinFsp may call releasedir twice, or not at all: neither is an error.
++    ASSERT(!map.Erase(dir));
++    ASSERT(!map.Erase(0));
++    ASSERT(map.Erase(root));
++    ASSERT(map.Count() == 0);
++
++    // An unknown handle, and handle 0, simply miss.
++    ASSERT(!map.Find(0, path));
++    ASSERT(!map.Find(999999, path));
++
++    map.Clear();
++    return 0;
++}
++
++// WinFsp is not required to call releasedir(), so the table must stay bounded
++// without any help from the caller: the oldest handle is dropped, not the one
++// that is in use.
++static int test_bounded()
++{
++    DirHandleMap& map = DirHandleMap::Get();
++    map.Clear();
++
++    std::uint64_t first = 0;
++    std::uint64_t last  = 0;
++    for(std::size_t i = 0; i < DirHandleMap::MaxEntries + 8; ++i){
++        std::uint64_t handle = map.Store("/dir/" + std::to_string(i));
++        if(0 == i){
++            first = handle;
++        }
++        last = handle;
++    }
++    ASSERT(map.Count() == DirHandleMap::MaxEntries);
++
++    std::string path;
++    ASSERT(!map.Find(first, path));           // the oldest one made room
++    ASSERT(map.Find(last, path));             // the one in use did not
++    ASSERT(path == "/dir/" + std::to_string(DirHandleMap::MaxEntries + 7));
++    // Forgetting an already forgotten handle - the releasedir() WinFsp may or
++    // may not call - is a no-op, not an error.
++    ASSERT(!map.Erase(first));
++
++    map.Clear();
++    return 0;
++}
++
++// What s3fs_readdir() does with its arguments: keep the path FUSE passed, and
++// fall back to the handle when it passed none.
++static int test_resolve_dir_path()
++{
++    DirHandleMap& map = DirHandleMap::Get();
++    map.Clear();
++
++    const std::uint64_t root = map.Store("/");
++    const std::uint64_t dir  = map.Store("/harbor-deploy");
++
++    // The Linux kernel repeats the path: the handle is not even looked at.
++    ASSERT(resolve_dir_path("/", root) == "/");
++    ASSERT(resolve_dir_path("/harbor-deploy", 0) == "/harbor-deploy");
++
++    // WinFsp names the directory by its handle and passes no path at all.
++    // This is the case that made the mount point list nothing but "." and "..".
++    ASSERT(resolve_dir_path("", root) == "/");
++    ASSERT(resolve_dir_path("", dir) == "/harbor-deploy");
++    ASSERT(resolve_dir_path(nullptr, dir) == "/harbor-deploy");
++
++    // The Windows spellings of the root are not empty, so they come back as
++    // they went in: turning "\" or "." into "/" is fuse_path_normalize()'s
++    // job, which the callback runs over whatever this function returned(see
++    // test_path_normalize in test_string_util.cpp for that half).
++    ASSERT(resolve_dir_path("\\", root) == "\\");
++    ASSERT(resolve_dir_path(".", root) == ".");
++
++    // Nothing to recover from: the caller answers ESTALE, as upstream does.
++    ASSERT(resolve_dir_path("", 0).empty());
++    ASSERT(resolve_dir_path(nullptr, 0).empty());
++    ASSERT(resolve_dir_path("", 999999).empty());
++    ASSERT(resolve_dir_path(nullptr, 999999).empty());
++    ASSERT(resolve_dir_path(nullptr, 0).empty());
++
++    // After releasedir() the handle is gone, and a readdir() that comes after
++    // it misses instead of listing the wrong directory.
++    ASSERT(map.Erase(dir));
++    ASSERT(resolve_dir_path("", dir).empty());
++    ASSERT(resolve_dir_path("/harbor-deploy", dir) == "/harbor-deploy");
++
++    map.Clear();
++    return 0;
++}
++
++// A full opendir/readdir/releasedir sequence, the way the callbacks use it.
++static int test_open_readdir_release()
++{
++    DirHandleMap& map = DirHandleMap::Get();
++    map.Clear();
++
++    // opendir("/harbor-deploy") stores the path and hands the handle to FUSE.
++    std::uint64_t fh = map.Store("/harbor-deploy");
++    ASSERT(0 != fh);
++
++    // Three readdir() calls on that handle - WinFsp may ask more than once -
++    // all name the same directory.
++    for(int i = 0; i < 3; ++i){
++        ASSERT(resolve_dir_path("", fh) == "/harbor-deploy");
++    }
++
++    // A second directory gets its own handle and its own path.
++    std::uint64_t other = map.Store("/");
++    ASSERT(other != fh);
++    ASSERT(resolve_dir_path("", other) == "/");
++    ASSERT(resolve_dir_path("", fh) == "/harbor-deploy");
++
++    // releasedir() forgets one without disturbing the other.
++    ASSERT(map.Erase(other));
++    ASSERT(resolve_dir_path("", other).empty());
++    ASSERT(resolve_dir_path("", fh) == "/harbor-deploy");
++
++    map.Clear();
++    return 0;
++}
++
++// The placeholder stat: a directory must still look like one, a file like a
++// file, and neither may come out as mode 0(which is no type at all).
++static int test_fallback_stat()
++{
++    struct stat dir = make_fallback_stat(true);
++    struct stat reg = make_fallback_stat(false);
++
++    ASSERT(S_ISDIR(dir.st_mode));
++    ASSERT(!S_ISREG(dir.st_mode));
++    ASSERT(S_ISREG(reg.st_mode));
++    ASSERT(!S_ISDIR(reg.st_mode));
++
++    ASSERT((dir.st_mode & 07777) != 0);
++    ASSERT((reg.st_mode & 07777) != 0);
++    ASSERT((reg.st_mode & 0111) == 0);         // a plain file is not executable
++    ASSERT((dir.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0);
++
++    ASSERT(dir.st_nlink == 1);
++    ASSERT(dir.st_size == 0);
++    return 0;
++}
++
++int main()
++{
++    int result = 0;
++    result |= test_store_find_erase();
++    result |= test_bounded();
++    result |= test_resolve_dir_path();
++    result |= test_open_readdir_release();
++    result |= test_fallback_stat();
++    if(0 != result){
++        std::fprintf(stderr, "FAIL test_dirhandle(see the assertion above)\n");
++        return 1;
++    }
++    std::fprintf(stderr, "PASS test_dirhandle\n");
++    return 0;
++}
++
++/*
++* Local variables:
++* tab-width: 4
++* c-basic-offset: 4
++* End:
++* vim600: expandtab sw=4 ts=4 fdm=marker
++* vim<600: expandtab sw=4 ts=4
++*/
+diff --git a/src/test_metaheader.cpp b/src/test_metaheader.cpp
+index 787a656..6cc9c88 100644
+--- a/src/test_metaheader.cpp
++++ b/src/test_metaheader.cpp
+@@ -19,11 +19,20 @@
+  */
+ 
+ #include <string>
++#include <utility>
+ 
+ #include "filetimes.h"
+ #include "metaheader.h"
+ #include "test_util.h"
+ 
++//
++// [NOTE]
++// "struct timespec::tv_nsec" is a long on Linux and a 64 bit integer in the
++// fuse_timespec that the Windows(WinFsp) build uses(see win_posix.h), so the
++// expected values below are cast to the type of the member itself.
++//
++using nsec_t = decltype(std::declval<struct timespec>().tv_nsec);
++
+ //-------------------------------------------------------------------
+ // Global variables for test_metaheader
+ //-------------------------------------------------------------------
+@@ -50,7 +59,7 @@ static void test_negative_times()
+     headers_t nsecmeta;
+     nsecmeta["x-amz-meta-mtime"] = "-315619140.123";
+     ASSERT_EQUALS(static_cast<time_t>(-315619140), get_mtime(nsecmeta).tv_sec);
+-    ASSERT_EQUALS(static_cast<long>(123), get_mtime(nsecmeta).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(123), get_mtime(nsecmeta).tv_nsec);
+ }
+ 
+ //
+@@ -60,9 +69,9 @@ static void test_negative_times()
+ static void test_missing_times()
+ {
+     headers_t empty;
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_mtime(empty, false).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_ctime(empty, false).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_atime(empty, false).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_mtime(empty, false).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_ctime(empty, false).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_atime(empty, false).tv_nsec);
+ 
+     headers_t lastmod;
+     lastmod["Last-Modified"] = "Mon, 03 Feb 2020 04:05:06 GMT";
+@@ -74,9 +83,9 @@ static void test_missing_times()
+     // date a directory that only exists as a key prefix to one second before
+     // the epoch instead of defaulting it.
+     //
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_mtime(empty, true).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_ctime(empty, true).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_atime(empty, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_mtime(empty, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_ctime(empty, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_atime(empty, true).tv_nsec);
+ }
+ 
+ //
+@@ -95,9 +104,9 @@ static void test_unparsable_lastmodified()
+ 
+     headers_t bad;
+     bad["Last-Modified"] = "not a date";
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_mtime(bad, true).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_ctime(bad, true).tv_nsec);
+-    ASSERT_EQUALS(static_cast<long>(UTIME_OMIT), get_atime(bad, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_mtime(bad, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_ctime(bad, true).tv_nsec);
++    ASSERT_EQUALS(static_cast<nsec_t>(UTIME_OMIT), get_atime(bad, true).tv_nsec);
+ }
+ 
+ //
+diff --git a/src/test_string_util.cpp b/src/test_string_util.cpp
+index a4f7bcd..f9b667c 100644
+--- a/src/test_string_util.cpp
++++ b/src/test_string_util.cpp
+@@ -19,8 +19,10 @@
+  */
+ 
+ #include <cstdlib>
++#include <cstring>
+ #include <ctime>
+ #include <string>
++#include <libgen.h>                 // dirname()/basename() to compare against, see test_path_components()
+ 
+ #include "s3fs_logger.h"
+ #include "string_util.h"
+@@ -373,6 +375,197 @@ static void test_is_valid_region_name()
+     ASSERT_FALSE(is_valid_region_name("us_east_1"));
+ }
+ 
++// [NOTE]
++// fuse_path_normalize() only changes what the Windows(WinFsp) build receives,
++// but it is compiled on every platform, so the Linux paths are checked here as
++// well: they must come back unchanged.
++static void test_path_normalize()
++{
++    // the spellings of the mount point all become "/"
++    ASSERT_EQUALS("/"s, fuse_path_normalize(nullptr));
++    ASSERT_EQUALS("/"s, fuse_path_normalize(""));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("."));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("/"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("\\"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("./"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize(".\\"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("/."));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("\\."));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("//"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("\\\\"));
++    ASSERT_EQUALS("/"s, fuse_path_normalize("/./"));
++
++    // a Windows style path becomes the "/" separated one the FUSE layer wants
++    ASSERT_EQUALS("/autorun.inf"s, fuse_path_normalize("\\autorun.inf"));
++    ASSERT_EQUALS("/dir/autorun.inf"s, fuse_path_normalize("\\dir\\autorun.inf"));
++    ASSERT_EQUALS("/dir/autorun.inf"s, fuse_path_normalize("/dir/autorun.inf"));
++
++    // repeated separators are collapsed, a missing leading one is added
++    ASSERT_EQUALS("/a/b"s, fuse_path_normalize("/a//b"));
++    ASSERT_EQUALS("/a/b"s, fuse_path_normalize("\\a\\\\b"));
++    ASSERT_EQUALS("/a/b"s, fuse_path_normalize("a/b"));
++    ASSERT_EQUALS("/a/b/"s, fuse_path_normalize("/a/b//"));
++    ASSERT_EQUALS("/a/b/"s, fuse_path_normalize("/a/b/"));
++
++    // A relative name gets the leading separator the FUSE contract asks for:
++    // WinFsp may hand over "desktop.ini" where the Linux kernel sends
++    // "/desktop.ini", and without the separator s3fs would ask the server for
++    // a different object than the one it just listed.
++    ASSERT_EQUALS("/desktop.ini"s, fuse_path_normalize("desktop.ini"));
++    ASSERT_EQUALS("/desktop.ini"s, fuse_path_normalize("\\desktop.ini"));
++    ASSERT_EQUALS("/dir/desktop.ini"s, fuse_path_normalize("dir/desktop.ini"));
++    ASSERT_EQUALS("/dir/新IP.xlsx"s, fuse_path_normalize("dir/新IP.xlsx"));
++    ASSERT_EQUALS("/dir/新IP.xlsx"s, fuse_path_normalize("\\dir\\新IP.xlsx"));
++
++    // "." at the end of a directory is that directory, ".." is a real name
++    ASSERT_EQUALS("/dir"s, fuse_path_normalize("/dir/."));
++    ASSERT_EQUALS("/dir"s, fuse_path_normalize("\\dir\\."));
++    ASSERT_EQUALS("/dir/.."s, fuse_path_normalize("/dir/.."));
++    ASSERT_EQUALS("/.."s, fuse_path_normalize(".."));
++
++    // the paths a Linux kernel hands over are unchanged
++    ASSERT_EQUALS("/"s,                  fuse_path_normalize("/"));
++    ASSERT_EQUALS("/file.txt"s,          fuse_path_normalize("/file.txt"));
++    ASSERT_EQUALS("/dir/sub/file.txt"s,  fuse_path_normalize("/dir/sub/file.txt"));
++    ASSERT_EQUALS("/dir with space/f"s,  fuse_path_normalize("/dir with space/f"));
++    ASSERT_EQUALS("/a/b/../c"s,          fuse_path_normalize("/a/b/../c"));
++    ASSERT_EQUALS("/dir/"s,              fuse_path_normalize("/dir/"));
++    ASSERT_EQUALS("/" + "\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88"s, fuse_path_normalize("/\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88"));  // "/test" in Japanese
++
++    // normalizing twice changes nothing more
++    for(const char* path : {"", ".", "/", "\\", "/a//b", "\\dir\\autorun.inf", "/dir/.", "..", "/dir/sub/file.txt"}) {
++        std::string once = fuse_path_normalize(path);
++        ASSERT_EQUALS(once, fuse_path_normalize(once.c_str()));
++    }
++}
++
++// [NOTE]
++// fuse_request_path_normalize() is what get_realpath() in s3fs_util.cpp puts in
++// front of every object key of every request the Windows build sends, so these
++// are the values that actually reach the server.  It is fuse_path_normalize()
++// plus one exception, and that exception is the point of the first block: the
++// request "HEAD //" is how upstream asks for the object named "/" at the bucket
++// root, and collapsing it would ask for a different object.
++static void test_request_path_normalize()
++{
++    // the bucket root spelling survives
++    ASSERT_EQUALS("//"s,          fuse_request_path_normalize("//"));
++    ASSERT_EQUALS("/"s,           fuse_request_path_normalize("/"));
++    ASSERT_EQUALS("/"s,           fuse_request_path_normalize(""));
++    ASSERT_EQUALS("/"s,           fuse_request_path_normalize(nullptr));
++
++    // everything else is fuse_path_normalize()
++    ASSERT_EQUALS("/server.csv"s, fuse_request_path_normalize("/server.csv"));
++    ASSERT_EQUALS("/server.csv"s, fuse_request_path_normalize("\\server.csv"));
++    ASSERT_EQUALS("/dir"s,        fuse_request_path_normalize("/dir/."));
++    ASSERT_EQUALS("/dir"s,        fuse_request_path_normalize("\\dir\\."));
++    ASSERT_EQUALS("/dir/"s,       fuse_request_path_normalize("/dir/"));
++    ASSERT_EQUALS("/新IP.xlsx"s,  fuse_request_path_normalize("\\新IP.xlsx"));
++
++    // only the exact two slash spelling is kept: "//dir" is a doubled
++    // separator, not the bucket root, and still collapses
++    ASSERT_EQUALS("/dir"s,        fuse_request_path_normalize("//dir"));
++    ASSERT_EQUALS("/dir"s,        fuse_request_path_normalize("///dir"));
++
++    // the paths a Linux kernel hands over are unchanged
++    ASSERT_EQUALS("/dir/sub/file.txt"s, fuse_request_path_normalize("/dir/sub/file.txt"));
++}
++
++// [NOTE]
++// posix_dirname()/posix_basename() replace the C library dirname()/basename()
++// for the paths s3fs handles itself.  The two C library implementations are the
++// reason they exist: on Windows dirname("/server.csv") answers "\" where glibc
++// answers "/", and basename("/") answers "\" where glibc answers "/".
++// The loop at the bottom compares against the C library itself, which is only
++// meaningful where the C library is the POSIX one.
++static void test_path_components()
++{
++    // the spellings a Windows build used to hand to the server
++    ASSERT_EQUALS("/"s,  posix_dirname("/server.csv"));
++    ASSERT_EQUALS("/"s,  posix_dirname("/"));
++    ASSERT_EQUALS("/"s,  posix_dirname("//"));
++    ASSERT_EQUALS("/"s,  posix_dirname("///"));
++    ASSERT_EQUALS("/"s,  posix_dirname("/dir/"));
++    ASSERT_EQUALS("/"s,  posix_dirname("/harbor-deploy/"));
++    ASSERT_EQUALS("/dir"s, posix_dirname("/dir/f"));
++    ASSERT_EQUALS("/dir"s, posix_dirname("/dir/."));
++    ASSERT_EQUALS("/dir"s, posix_dirname("/dir/.."));
++    ASSERT_EQUALS("/a/b"s, posix_dirname("/a/b/c"));
++    ASSERT_EQUALS("."s,    posix_dirname("file"));
++    ASSERT_EQUALS("."s,    posix_dirname("."));
++    ASSERT_EQUALS("."s,    posix_dirname(".."));
++    ASSERT_EQUALS("."s,    posix_dirname(""));
++    ASSERT_EQUALS("/"s,    posix_dirname("/新IP.xlsx"));
++
++    // a local Windows cache path keeps the parent the MSVCRT one gave
++    ASSERT_EQUALS("C:\\cache\\file1/dir"s, posix_dirname("C:\\cache\\file1/dir/f"));
++    ASSERT_EQUALS("C:\\cache\\file1"s,     posix_dirname("C:\\cache\\file1/dir"));
++    ASSERT_EQUALS("\\dir"s,                posix_dirname("\\dir\\f"));
++
++    ASSERT_EQUALS("server.csv"s, posix_basename("/server.csv"));
++    ASSERT_EQUALS("/"s,          posix_basename("/"));
++    ASSERT_EQUALS("/"s,          posix_basename("//"));
++    ASSERT_EQUALS("harbor-deploy"s, posix_basename("/harbor-deploy/"));
++    ASSERT_EQUALS("f"s,          posix_basename("/dir/f"));
++    ASSERT_EQUALS("f"s,          posix_basename("C:\\cache\\file1/dir/f"));
++    ASSERT_EQUALS("f"s,          posix_basename("\\dir\\f"));
++    ASSERT_EQUALS("新IP.xlsx"s,  posix_basename("/dir/新IP.xlsx"));
++    ASSERT_EQUALS(".."s,         posix_basename("/dir/.."));
++    ASSERT_EQUALS("."s,          posix_basename(""));
++
++#ifndef __MSYS__
++    // On the platform whose C library these helpers are modelled on, they must
++    // agree with it for every path that uses only "/".  A backslash is a
++    // separator here and not there, so those are not compared.
++    for(const char* path : {"", ".", "..", "/", "///", "/foo", "/foo/", "/foo//", "/foo/bar",
++                            "foo", "foo/", "a/", "/dir/.", "/dir/..", "/dir/f", "/a/b/c",
++                            "/新IP.xlsx", "/dir with space/f"}) {
++        // dirname() is allowed to edit the string it is given, so each call gets
++        // its own copy.
++        char buf_dir[512];
++        char buf_base[512];
++        strcpy(buf_dir, path);
++        strcpy(buf_base, path);
++        ASSERT_EQUALS(std::string(dirname(buf_dir)),   posix_dirname(path));
++        ASSERT_EQUALS(std::string(basename(buf_base)), posix_basename(path));
++    }
++#endif
++
++    // The divergence these helpers exist for, measured against the C library of
++    // whichever platform this binary runs on: the MSVCRT one that mingw's
++    // dirname() forwards to answers "\" to dirname("/server.csv"), glibc answers
++    // "/".  posix_dirname() answers "/" on both, which is the value
++    // check_parent_object_access() compares its parent against.
++    {
++#ifdef __MSYS__
++        const std::string libc_answer = "\\"s;
++#else
++        const std::string libc_answer = "/"s;
++#endif
++        char buf[64];
++        strcpy(buf, "/server.csv");
++        ASSERT_EQUALS(libc_answer, std::string(dirname(buf)));
++        ASSERT_EQUALS("/"s, posix_dirname("/server.csv"));
++    }
++}
++
++// [NOTE]
++// bytes_hex() is only used by a Windows log line, but it is pure and cheap, so
++// it is checked on both platforms.
++static void test_bytes_hex()
++{
++    ASSERT_EQUALS(""s,          bytes_hex(""));
++    ASSERT_EQUALS("2f"s,        bytes_hex("/"));
++    ASSERT_EQUALS("5c"s,        bytes_hex("\\"));
++    ASSERT_EQUALS("2f 78"s,     bytes_hex("/x"));
++    // One UTF-8 encoded character(three bytes), spelled out as bytes so that the
++    // compiler's execution character set cannot get between the test and it:
++    // "\xe4" in a string literal is a code point that a UTF-8 execution charset
++    // happily re-encodes into two bytes.
++    static constexpr char MULTI[] = {static_cast<char>(0xe4), static_cast<char>(0xb8), static_cast<char>(0xb2), '\0'};
++    ASSERT_EQUALS("e4 b8 b2"s,  bytes_hex(MULTI));
++}
++
+ int main(int argc, const char *argv[])
+ {
+     S3fsLog singletonLog;
+@@ -388,6 +581,10 @@ int main(int argc, const char *argv[])
+     test_parse_xattrs();
+     test_parse_dates();
+     test_is_valid_region_name();
++    test_path_normalize();
++    test_request_path_normalize();
++    test_path_components();
++    test_bytes_hex();
+ 
+     return 0;
+ }
+diff --git a/src/test_tmpfile.cpp b/src/test_tmpfile.cpp
+new file mode 100644
+index 0000000..a12d91d
+--- /dev/null
++++ b/src/test_tmpfile.cpp
+@@ -0,0 +1,220 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Takeshi Nakatani <ggtakec.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++//
++// Tests the temporary file FdManager::MakeTempFile() builds: a file that is
++// already unlinked, so that its name is gone once the descriptor is closed
++// while reads and writes keep working until then.
++//
++// The Windows CRT cannot unlink a file that is still open, which is why it
++// needs its own way of getting there(see s3fs_tempfile_unlinked() in
++// win_posix.h).  Both sides of that #ifdef are checked here: run this test
++// natively and, for the Windows target, under wine.
++//
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cerrno>
++#include <string>
++#include <dirent.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "win_posix.h"      // s3fs_tempfile_unlinked() on Windows, empty elsewhere
++
++#define TMPFILE_TEMPLATE    "./s3fststXXXXXX"
++#define TMPFILE_PREFIX      "s3fstst"
++
++#define ASSERT(cond)                                                        \
++    do {                                                                    \
++        if(!(cond)){                                                        \
++            std::fprintf(stderr, "FAIL %s:%d: %s (errno=%d)\n", __FILE__, __LINE__, #cond, errno); \
++            std::fflush(stderr);                                            \
++            return 1;                                                       \
++        }                                                                   \
++    } while(0)
++
++//-------------------------------------------------------------------
++// Helpers
++//-------------------------------------------------------------------
++// The body of FdManager::MakeTempFile(), down to the descriptor: the same
++// #ifdef, so that what is tested is what the file system uses.
++static int make_unlinked_tempfile(char* tmpl)
++{
++    int fd = mkstemp(tmpl);
++    if(-1 == fd){
++        return -1;
++    }
++#ifdef __MSYS__
++    return s3fs_tempfile_unlinked(fd, tmpl);
++#else
++    if(0 != unlink(tmpl)){
++        int saved_errno = errno;
++        close(fd);
++        errno = saved_errno;
++        return -1;
++    }
++    return fd;
++#endif
++}
++
++static bool file_exists(const char* path)
++{
++    struct stat st;
++    return (0 == stat(path, &st));
++}
++
++// How many files starting with TMPFILE_PREFIX are left in the directory.
++static int count_tempfiles()
++{
++    int count = 0;
++    DIR* dp;
++    if(nullptr == (dp = opendir("."))){
++        std::fprintf(stderr, "FAIL could not open the current directory(errno=%d)\n", errno);
++        return -1;
++    }
++    for(const struct dirent* dent = readdir(dp); nullptr != dent; dent = readdir(dp)){
++        if(0 == strncmp(dent->d_name, TMPFILE_PREFIX, sizeof(TMPFILE_PREFIX) - 1)){
++            ++count;
++        }
++    }
++    closedir(dp);
++    return count;
++}
++
++//-------------------------------------------------------------------
++// Tests
++//-------------------------------------------------------------------
++// The file is created, written and read back, and its name is gone after the
++// descriptor is closed.  One round.
++static int test_one_round()
++{
++    char tmpl[] = TMPFILE_TEMPLATE;
++
++    // create
++    int fd = make_unlinked_tempfile(tmpl);
++    ASSERT(-1 != fd);
++    ASSERT('\0' != tmpl[0]);
++
++    // the name is still the one mkstemp() picked
++    std::string name = tmpl;
++    ASSERT(nullptr != strstr(name.c_str(), TMPFILE_PREFIX));
++
++    // write and read back through stdio, the way FdEntity does
++    FILE* fp = fdopen(fd, "rb+");
++    ASSERT(nullptr != fp);
++    ASSERT(11 == fwrite("0123456789A", 1, 11, fp));
++    ASSERT(0 == fflush(fp));
++
++    struct stat st;
++    ASSERT(0 == fstat(fileno(fp), &st));
++    ASSERT(11 == static_cast<long long>(st.st_size));
++
++    // ... and through pread()/pwrite(), the way FdEntity::Read()/Write() do
++    char    buf[16] = {};
++    ASSERT(3 == pwrite(fileno(fp), "XYZ", 3, 0));
++    ASSERT(3 == pread(fileno(fp), buf, 3, 0));
++    ASSERT(0 == memcmp(buf, "XYZ", 3));
++
++    // truncate and fsync, the way FdEntity::Open() does
++    ASSERT(0 == ftruncate(fileno(fp), 20));
++    ASSERT(0 == fsync(fileno(fp)));
++    ASSERT(0 == fstat(fileno(fp), &st));
++    ASSERT(20 == static_cast<long long>(st.st_size));
++
++    // s3fs hands the descriptor to a second reader with dup()(FdEntity::Dup,
++    // curl.cpp); the file must outlive the first descriptor, not be deleted by
++    // closing it.
++    int dupfd = dup(fileno(fp));
++    ASSERT(-1 != dupfd);
++    ASSERT(3 == pread(dupfd, buf, 3, 0));
++    ASSERT(0 == memcmp(buf, "XYZ", 3));
++
++    fclose(fp);
++#ifdef __MSYS__
++    // On Windows the name is only removed with the last descriptor.
++    ASSERT(file_exists(name.c_str()));
++#endif
++    ASSERT(-1 != close(dupfd));
++
++    // closed -> the name is gone on both platforms
++    ASSERT(!file_exists(name.c_str()));
++
++    return 0;
++}
++
++// Nothing accumulates: creating and closing several of them leaves no leftover.
++static int test_no_leftovers()
++{
++    int before = count_tempfiles();
++    if(0 > before){
++        return 1;
++    }
++    for(int count = 0; count < 3; ++count){
++        char tmpl[] = TMPFILE_TEMPLATE;
++        int  fd     = make_unlinked_tempfile(tmpl);
++        if(-1 == fd){
++            return 1;
++        }
++        if(0 != close(fd)){
++            return 1;
++        }
++    }
++    return (before == count_tempfiles() ? 0 : 1);
++}
++
++// A template whose directory does not exist must fail, not crash.
++static int test_failure()
++{
++    char tmpl[] = "./no/such/dir/s3fststXXXXXX";
++    int  fd     = mkstemp(tmpl);
++    if(-1 != fd){
++        close(fd);
++        unlink(tmpl);
++        return 1;
++    }
++    return 0;
++}
++
++int main()
++{
++    int result = 0;
++    result |= test_one_round();
++    result |= test_no_leftovers();
++    result |= test_failure();
++    if(0 != result){
++        std::fprintf(stderr, "FAIL test_tmpfile(see the assertion above)\n");
++        return 1;
++    }
++    std::fprintf(stderr, "PASS test_tmpfile\n");
++    return 0;
++}
++
++/*
++* Local variables:
++* tab-width: 4
++* c-basic-offset: 4
++* End:
++* vim600: expandtab sw=4 ts=4 fdm=marker
++* vim<600: expandtab sw=4 ts=4
++*/
+diff --git a/src/threadpoolman.cpp b/src/threadpoolman.cpp
+index c3a4d9c..e7004ce 100644
+--- a/src/threadpoolman.cpp
++++ b/src/threadpoolman.cpp
+@@ -175,7 +175,11 @@ void ThreadPoolMan::Worker(ThreadPoolMan* psingleton, std::promise<int> promise)
+         // run function
+         void* retval;
+         if(nullptr != (retval = param.pfunc(s3fscurl, param.args))){
+-            S3FS_PRN_DBG("The instruction function returned with something error code(%ld).", reinterpret_cast<long>(retval));
++            // [NOTE]
++            // The instruction functions return an errno packed into a pointer,
++            // so it is printed as a long long: on Windows(long is 32 bits) a
++            // pointer does not fit into a long.
++            S3FS_PRN_DBG("The instruction function returned with something error code(%lld).", reinterpret_cast<long long>(retval));
+         }
+         if(param.psem){
+             param.psem->release();
+diff --git a/src/types.h b/src/types.h
+index 757b89e..300c9cf 100644
+--- a/src/types.h
++++ b/src/types.h
+@@ -30,6 +30,11 @@
+ #include <utility>
+ #include <vector>
+ 
++//
++// The POSIX layer for the Windows(mingw) build; empty on every other platform.
++//
++#include "win_posix.h"
++
+ //
+ // For extended attribute
+ // (HAVE_XXX symbols are defined in config.h)
+diff --git a/src/win_api_undef.h b/src/win_api_undef.h
+new file mode 100644
+index 0000000..ec4c42f
+--- /dev/null
++++ b/src/win_api_undef.h
+@@ -0,0 +1,45 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Takeshi Nakatani <ggtakec.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef S3FS_WIN_API_UNDEF_H_
++#define S3FS_WIN_API_UNDEF_H_
++
++//
++// The Win32 macros that <curl/curl.h> drags in with <windows.h> and that
++// collide with names s3fs uses.  Include this right after <curl/curl.h>.
++//
++//   DELETE          : winreg.h access right   -> REQTYPE::DELETE in curl.h
++//   GetCurrentTime  : winbase.h -> GetTickCount -> S3fsLog::GetCurrentTime()
++//
++#ifdef __MSYS__
++#undef DELETE
++#undef GetCurrentTime
++#endif
++
++#endif // S3FS_WIN_API_UNDEF_H_
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: expandtab sw=4 ts=4 fdm=marker
++ * vim<600: expandtab sw=4 ts=4
++ */
+diff --git a/src/win_dlfcn.h b/src/win_dlfcn.h
+new file mode 100644
+index 0000000..c3edb51
+--- /dev/null
++++ b/src/win_dlfcn.h
+@@ -0,0 +1,96 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Takeshi Nakatani <ggtakec.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef S3FS_WIN_DLFCN_H_
++#define S3FS_WIN_DLFCN_H_
++
++//
++// A <dlfcn.h> for the Windows(mingw-w64) build.
++//
++// mingw-w64 does not ship <dlfcn.h>, and s3fs only needs the four functions
++// below, for the optional external credential library(-o credlib).  They are
++// mapped onto the Win32 loader here.  This header is included instead of
++// <dlfcn.h> when building with __MSYS__(see s3fs_cred.cpp), so the POSIX
++// builds do not see it at all.
++//
++// [NOTE]
++// The "flag" argument of dlopen() and the search rules of the dynamic loader
++// are ignored: LoadLibraryA() uses the standard Windows DLL search order.
++//
++
++#include <cstdio>
++#include <windows.h>
++
++#define RTLD_LAZY   0x0000
++#define RTLD_NOW    0x0001
++
++inline void* dlopen(const char* filename, int /*flag*/)
++{
++    if(!filename){
++        return nullptr;
++    }
++    return reinterpret_cast<void*>(LoadLibraryA(filename));
++}
++
++inline void* dlsym(void* handle, const char* name)
++{
++    if(!handle || !name){
++        return nullptr;
++    }
++    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name));
++}
++
++inline int dlclose(void* handle)
++{
++    if(!handle){
++        return -1;
++    }
++    return FreeLibrary(static_cast<HMODULE>(handle)) ? 0 : -1;
++}
++
++//
++// [NOTE]
++// The reason is formatted from GetLastError() into a static buffer, which is
++// good enough for the one caller that prints it immediately afterwards.
++//
++inline const char* dlerror()
++{
++    static char szErr[128];
++
++    DWORD LastError = GetLastError();
++    if(0 == LastError){
++        return nullptr;
++    }
++    snprintf(szErr, sizeof(szErr), "GetLastError()=0x%08lx", static_cast<unsigned long>(LastError));
++    SetLastError(0);
++
++    return szErr;
++}
++
++#endif // S3FS_WIN_DLFCN_H_
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: expandtab sw=4 ts=4 fdm=marker
++ * vim<600: expandtab sw=4 ts=4
++ */
+diff --git a/src/win_posix.h b/src/win_posix.h
+new file mode 100644
+index 0000000..2468c67
+--- /dev/null
++++ b/src/win_posix.h
+@@ -0,0 +1,915 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Takeshi Nakatani <ggtakec.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef S3FS_WIN_POSIX_H_
++#define S3FS_WIN_POSIX_H_
++
++//
++// A small POSIX layer for the Windows(mingw-w64) build.
++//
++// Upstream builds s3fs for Windows in the MSYS2 *MSYS* shell, i.e. with the
++// Cygwin derived compiler, where struct stat/uid_t/regcomp() are all there and
++// WinFsp maps its fuse_* types onto them(see winfsp_fuse.h, __CYGWIN__ branch).
++// When cross compiling with mingw-w64 instead - which is how we get an s3fs.exe
++// that does not need the Cygwin runtime - three things are missing:
++//
++//   1) the POSIX types(uid_t, gid_t, blkcnt_t, ...) and the S_IFLNK/S_ISLNK
++//      macros, which the mingw-w64 headers do not declare at all;
++//   2) the POSIX functions(timegm, gmtime_r, fsync, utimensat, getpwuid_r,
++//      sigaction, regcomp, ...);
++//   3) the fuse_* structures: WinFsp hands a "struct fuse_stat" to every
++//      callback while the CRT's "struct stat" has neither st_blocks nor
++//      st_blksize, so the two are not interchangeable.
++//
++// This header supplies all three.  It is included from common.h and types.h
++// and everything in it is behind __MSYS__, so the POSIX builds are untouched.
++//
++// [NOTE]
++// It includes the CRT headers it needs before defining the aliases below, so
++// that the CRT's own declarations are not rewritten by them.  Include this
++// header before any other project header.
++//
++
++#ifdef __MSYS__
++
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <regex>
++#include <direct.h>
++#include <fcntl.h>
++#include <io.h>
++#include <signal.h>
++#include <share.h>              // _sopen()/_O_TEMPORARY, see s3fs_tempfile_unlinked()
++#include <dirent.h>
++#include <direct.h>             // _wmkdir(), r9
++#include <stdio.h>              // _wfopen()/_wrename(), r9
++#include <stdarg.h>             // va_list in s3fs_wopen(), r9
++#include <wchar.h>              // wcslen(), r9
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/utime.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <winfsp_fuse.h>      // struct fuse_stat / fuse_statvfs / fuse_timespec / fuse_* types
++
++//-------------------------------------------------------------------
++// POSIX types the mingw-w64 headers do not declare
++//
++// They are the WinFsp types(fuse_uid_t & friends) under the POSIX names, so
++// that a struct fuse_stat can be filled in without conversions.
++//-------------------------------------------------------------------
++typedef fuse_uid_t        uid_t;
++typedef fuse_gid_t        gid_t;
++typedef fuse_blkcnt_t     blkcnt_t;
++typedef fuse_blksize_t    blksize_t;
++typedef fuse_fsblkcnt_t   fsblkcnt_t;
++
++//-------------------------------------------------------------------
++// errno values and limits the mingw-w64 headers do not declare
++//-------------------------------------------------------------------
++#ifndef ESTALE
++#define ESTALE      116     /* "Stale NFS file handle" in the Single UNIX Spec */
++#endif
++#ifndef EREMOTE
++#define EREMOTE     121     /* "Target address is remote" in the Single UNIX Spec */
++#endif
++#ifndef NAME_MAX
++#define NAME_MAX    255
++#endif
++#ifndef PATH_MAX
++#define PATH_MAX    260     // _MAX_PATH
++#endif
++
++//
++// The wait status macros: on Windows system() returns the exit code itself
++// rather than a wait status, so everything but the -1 it returns on failure is
++// treated as "the command ran".
++//
++#ifndef WIFEXITED
++#define WIFEXITED(status)       ((status) != -1)
++#endif
++#ifndef WEXITSTATUS
++#define WEXITSTATUS(status)     (status)
++#endif
++
++//-------------------------------------------------------------------
++// File type macros the mingw-w64 headers do not declare
++//-------------------------------------------------------------------
++#ifndef S_IFMT
++#define S_IFMT    0170000
++#endif
++#ifndef S_IFLNK
++#define S_IFLNK   0120000
++#endif
++#ifndef S_IFSOCK
++#define S_IFSOCK  0140000
++#endif
++#ifndef S_ISLNK
++#define S_ISLNK(mode)   (((mode) & S_IFMT) == S_IFLNK)
++#endif
++#ifndef S_ISSOCK
++#define S_ISSOCK(mode)  (((mode) & S_IFMT) == S_IFSOCK)
++#endif
++
++//-------------------------------------------------------------------
++// The FUSE structures are WinFsp's, not the CRT's
++//
++// [NOTE]
++// "struct stat" is used for the stat buffer that every FUSE callback fills in,
++// which is the great majority of the uses in s3fs.  The handful of places that
++// stat the *local* file system(cache file, passwd file, mime file) call
++// fuse_stat()/fuse_statvfs() below, which the "stat"/"statvfs" aliases turn
++// into fuse_stat()/fuse_statvfs() as well.
++//-------------------------------------------------------------------
++typedef struct timespec s3fs_crt_timespec;      // the CRT one, before the alias
++typedef struct _stat64  s3fs_crt_stat;          // the CRT one, before the alias
++
++#define stat        fuse_stat
++#define statvfs     fuse_statvfs
++#define timespec    fuse_timespec
++#define mode_t      fuse_mode_t
++#define dev_t       fuse_dev_t
++#define lstat       fuse_lstat
++#define fstat       fuse_fstat
++#define mkdir       fuse_mkdir
++#define link        fuse_link
++#define flock       fuse_flock
++#define dirfd       fuse_dirfd
++#define fstatat     fuse_fstatat
++#define futimens    fuse_futimens
++#define utimensat   fuse_utimensat
++
++// WinFsp maps the FUSE struct stat's st_ino straight to the Windows FileId
++// (FileInfo->IndexNumber in fuse_intf.c) and does not substitute a value of
++// its own for 0.  Upstream s3fs leaves st_ino at 0, so every object would
++// report the same FileId; Explorer identifies items by (volume, FileId) and
++// its copy/paste availability check misbehaves then, while drag&drop uses
++// paths and keeps working.  Hand WinFsp a stable, non-zero hash instead.
++// A trailing separator is ignored so that "/dir" and "/dir/" (the two
++// spellings s3fs uses for the same directory object) share one FileId.
++inline fuse_ino_t win_inode_from_path(const char* path)
++{
++    fuse_ino_t h = 1469598103934665603ULL;      // FNV-1a 64 offset basis
++    if(path){
++        size_t len = strlen(path);
++        while(0 < len && '/' == path[len - 1]){
++            len--;
++        }
++        for(size_t i = 0; i < len; ++i){
++            h ^= static_cast<unsigned char>(path[i]);
++            h *= 1099511628211ULL;              // FNV-1a 64 prime
++        }
++    }
++    return 0 != h ? h : 1;                      // 0 means "no FileId"
++}
++
++//
++// mingw-w64 does not define the UTIME_NOW/UTIME_OMIT markers of <sys/stat.h>.
++// s3fs only uses them as tv_nsec markers(see filetimes.cpp), so the glibc
++// values are copied here for the Windows(mingw) build.
++//
++#ifndef UTIME_NOW
++#define UTIME_NOW     ((1L << 30) - 1)
++#endif
++#ifndef UTIME_OMIT
++#define UTIME_OMIT    ((1L << 30) - 2)
++#endif
++
++//-------------------------------------------------------------------
++// stat()/statvfs()/futimens()/utimensat() for the local file system
++//
++// [NOTE]
++// These are defined before the st_atime/st_mtime/st_ctime aliases below,
++// because they read the CRT structure, whose members are still named
++// st_atime/st_mtime/st_ctime there.
++//-------------------------------------------------------------------
++//
++// Turn a CRT stat buffer into the fuse_stat the FUSE layer expects.
++//
++inline void s3fs_fill_fuse_stat(const s3fs_crt_stat& crtst, struct fuse_stat* stbuf)
++{
++    *stbuf = {};
++    stbuf->st_mode        = crtst.st_mode;
++    stbuf->st_size        = crtst.st_size;
++    stbuf->st_nlink       = 1;
++    stbuf->st_blksize     = 512;
++    stbuf->st_blocks      = (static_cast<blkcnt_t>(crtst.st_size) + 511) / 512;
++    stbuf->st_atim.tv_sec = crtst.st_atime;
++    stbuf->st_mtim.tv_sec = crtst.st_mtime;
++    stbuf->st_ctim.tv_sec = crtst.st_ctime;
++}
++
++//
++// [r9] UTF-8 aware path helpers.
++//
++// s3fs stores object names as UTF-8, but the CRT's A functions interpret
++// them in the system ANSI code page: every non-ASCII cache file name would
++// be created with mojibake, and some ANSI code pages even break the path
++// structure because a trail byte can be '\'.  Everything that takes a path
++// below converts to UTF-16 first and calls the W function.
++//
++#ifndef CP_UTF8
++#define CP_UTF8 65001
++#endif
++extern "C" {
++// Declared by hand instead of including <windows.h>, which does not mix
++// with the hand-declared CreateHardLinkA() below.
++__declspec(dllimport) int __stdcall MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
++__declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t* lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, int* lpUsedDefaultChar);
++}
++
++inline std::wstring s3fs_utf8_to_wide(const char* utf8)
++{
++    std::wstring wstr;
++    if(utf8 && '\0' != *utf8){
++        int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
++        if(0 < len){
++            wstr.resize(static_cast<size_t>(len) - 1);
++            MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &wstr[0], len);
++        }
++    }
++    return wstr;
++}
++
++inline std::string s3fs_wide_to_utf8(const wchar_t* wide, int wlen)
++{
++    std::string str;
++    if(wide && 0 < wlen){
++        int len = WideCharToMultiByte(CP_UTF8, 0, wide, wlen, nullptr, 0, nullptr, nullptr);
++        if(0 < len){
++            str.resize(static_cast<size_t>(len));
++            WideCharToMultiByte(CP_UTF8, 0, wide, wlen, &str[0], len, nullptr, nullptr);
++        }
++    }
++    return str;
++}
++
++inline int fuse_stat(const char* path, struct fuse_stat* stbuf)
++{
++    s3fs_crt_stat crtst = {};
++
++    int result = _wstat64(s3fs_utf8_to_wide(path).c_str(), &crtst);
++    if(0 == result){
++        s3fs_fill_fuse_stat(crtst, stbuf);
++    }
++    return result;
++}
++
++inline int fuse_fstat(int fd, struct fuse_stat* stbuf)
++{
++    s3fs_crt_stat crtst = {};
++
++    int result = _fstat64(fd, &crtst);
++    if(0 == result){
++        s3fs_fill_fuse_stat(crtst, stbuf);
++    }
++    return result;
++}
++
++//
++// [NOTE]
++// Windows has no symlinks on the cache directory, so lstat() is stat().
++//
++inline int fuse_lstat(const char* path, struct fuse_stat* stbuf)
++{
++    return fuse_stat(path, stbuf);
++}
++
++inline int fuse_mkdir(const char* path, mode_t /*mode*/)
++{
++    return _wmkdir(s3fs_utf8_to_wide(path).c_str());
++}
++
++//-------------------------------------------------------------------
++// [r9] UTF-8 aware directory listing and open/unlink/rename/fopen.
++// mingw's opendir()/readdir() and the CRT open()/unlink()/rename()/
++// fopen() are ANSI-only, and s3fs uses them on cache paths that carry
++// the object name as UTF-8.
++//-------------------------------------------------------------------
++struct s3fs_wdirent
++{
++    char d_name[1024];
++};
++
++struct s3fs_DIR
++{
++    _WDIR*         wdp;
++    s3fs_wdirent   ent;
++};
++
++inline s3fs_DIR* s3fs_wopendir(const char* path)
++{
++    std::wstring wpath = s3fs_utf8_to_wide(path);
++    if(wpath.empty()){
++        errno = ENOENT;
++        return nullptr;
++    }
++    _WDIR* wdp = _wopendir(wpath.c_str());
++    if(nullptr == wdp){
++        return nullptr;
++    }
++    s3fs_DIR* sdp = new s3fs_DIR();
++    sdp->wdp = wdp;
++    return sdp;
++}
++
++inline s3fs_wdirent* s3fs_wreaddir(s3fs_DIR* sdp)
++{
++    if(!sdp){
++        errno = EBADF;
++        return nullptr;
++    }
++    _wdirent* went = _wreaddir(sdp->wdp);
++    if(nullptr == went){
++        return nullptr;
++    }
++    std::string name = s3fs_wide_to_utf8(went->d_name, static_cast<int>(wcslen(went->d_name)));
++    if(sizeof(sdp->ent.d_name) <= name.size()){
++        name.resize(sizeof(sdp->ent.d_name) - 1);
++    }
++    memcpy(sdp->ent.d_name, name.c_str(), name.size() + 1);
++    return &sdp->ent;
++}
++
++inline int s3fs_wclosedir(s3fs_DIR* sdp)
++{
++    if(!sdp){
++        errno = EBADF;
++        return -1;
++    }
++    int result = _wclosedir(sdp->wdp);
++    delete sdp;
++    return result;
++}
++
++inline int s3fs_wopen(const char* path, int oflags, ...)
++{
++    std::wstring wpath = s3fs_utf8_to_wide(path);
++    if(wpath.empty()){
++        errno = ENOENT;
++        return -1;
++    }
++    int result;
++    if(0 != (oflags & _O_CREAT)){
++        va_list ap;
++        va_start(ap, oflags);
++        int pmode = va_arg(ap, int);
++        va_end(ap);
++        result = _wopen(wpath.c_str(), oflags, pmode);
++    }else{
++        result = _wopen(wpath.c_str(), oflags);
++    }
++    return result;
++}
++
++inline int s3fs_wunlink(const char* path)
++{
++    std::wstring wpath = s3fs_utf8_to_wide(path);
++    if(wpath.empty()){
++        errno = ENOENT;
++        return -1;
++    }
++    return _wunlink(wpath.c_str());
++}
++
++inline int s3fs_wrename(const char* oldpath, const char* newpath)
++{
++    std::wstring wold = s3fs_utf8_to_wide(oldpath);
++    std::wstring wnew = s3fs_utf8_to_wide(newpath);
++    if(wold.empty() || wnew.empty()){
++        errno = ENOENT;
++        return -1;
++    }
++    return _wrename(wold.c_str(), wnew.c_str());
++}
++
++inline FILE* s3fs_wfopen(const char* path, const char* mode)
++{
++    std::wstring wpath = s3fs_utf8_to_wide(path);
++    std::wstring wmode = s3fs_utf8_to_wide(mode);
++    if(wpath.empty() || wmode.empty()){
++        errno = ENOENT;
++        return nullptr;
++    }
++    return _wfopen(wpath.c_str(), wmode.c_str());
++}
++
++// The macros hand every s3fs call site the UTF-8 aware versions above.
++// open() is deliberately not macro-renamed: the C++ iostreams member
++// open() would be caught by it, so fdcache* call s3fs_wopen() directly.
++#define DIR         s3fs_DIR
++#define dirent      s3fs_wdirent
++#define opendir     s3fs_wopendir
++#define readdir     s3fs_wreaddir
++#define closedir    s3fs_wclosedir
++#define unlink      s3fs_wunlink
++#define rename      s3fs_wrename
++#define fopen       s3fs_wfopen
++
++//
++// CreateHardLinkA() is declared by hand: <windows.h> would bring in its DELETE
++// macro, which collides with s3fs's REQTYPE::DELETE enumerator(see curl.h).
++// The declaration matches the one in mingw-w64's winbase.h, so a later
++// <windows.h> in the same translation unit is a redeclaration, not a conflict.
++//
++extern "C" {
++__declspec(dllimport) int __stdcall CreateHardLinkA(const char* lpFileName, const char* lpExistingFileName, struct _SECURITY_ATTRIBUTES* lpSecurityAttributes);
++}
++
++inline int fuse_link(const char* oldpath, const char* newpath)
++{
++    if(CreateHardLinkA(newpath, oldpath, nullptr)){
++        return 0;
++    }
++    errno = (0 == _access(newpath, 0)) ? EEXIST : EPERM;
++    return -1;
++}
++
++//
++// [NOTE]
++// The CRT has no advisory file locking.  s3fs uses flock() only to serialise
++// its own cache file stats between processes, and a single s3fs.exe is the
++// normal Windows setup, so pretending the lock succeeded is safe here.
++//
++#define LOCK_SH     0x01
++#define LOCK_EX     0x02
++#define LOCK_NB     0x04
++#define LOCK_UN     0x08
++
++inline int fuse_flock(int fd, int operation)
++{
++    (void)fd;
++    (void)operation;
++    return 0;
++}
++
++//
++// mingw-w64's DIR has no file descriptor, so dirfd() hands out a dummy one and
++// fstatat() resolves the entry against the current directory instead of the
++// directory it belongs to.  That makes the "check all cache" debug output
++// report the entries it cannot stat; everything else uses full paths.
++//
++#define AT_FDCWD                (-100)
++#define AT_SYMLINK_NOFOLLOW     0x200
++
++inline int fuse_dirfd(DIR* dirp)
++{
++    return dirp ? 1 : -1;
++}
++
++inline int fuse_fstatat(int dirfd, const char* path, struct fuse_stat* stbuf, int flags)
++{
++    (void)dirfd;
++    (void)flags;
++    return fuse_stat(path, stbuf);
++}
++
++//
++// [NOTE]
++// _getdiskfree() works per drive, so a path that is not on the current drive
++// must carry its drive letter; that is why -o tmpdir= has to be absolute.
++//
++inline int fuse_statvfs(const char* path, struct fuse_statvfs* stbuf)
++{
++    unsigned int drive = 0;     // 0 = the current drive
++
++    if(path && '\0' != path[0] && ':' == path[1] &&
++       (('\0' != path[2] && ('/' == path[2] || '\\' == path[2])) || '\0' == path[2]) &&
++       (('A' <= path[0] && 'Z' >= path[0]) || ('a' <= path[0] && 'z' >= path[0])))
++    {
++        drive = static_cast<unsigned int>(path[0] - 'A' + 1);
++    }
++
++    struct _diskfree_t df = {};
++    if(0 != _getdiskfree(drive, &df)){
++        return -1;
++    }
++
++    *stbuf = {};
++    stbuf->f_frsize  = (df.bytes_per_sector ? df.bytes_per_sector : 512) * (df.sectors_per_cluster ? df.sectors_per_cluster : 1);
++    stbuf->f_bsize   = stbuf->f_frsize;
++    stbuf->f_blocks  = static_cast<fuse_fsblkcnt_t>(df.total_clusters);
++    stbuf->f_bfree   = static_cast<fuse_fsblkcnt_t>(df.avail_clusters);
++    stbuf->f_bavail  = static_cast<fuse_fsblkcnt_t>(df.avail_clusters);
++    stbuf->f_files   = 0;
++    stbuf->f_ffree   = 0;
++    stbuf->f_favail  = 0;
++    stbuf->f_namemax = 260;     // _MAX_PATH
++
++    return 0;
++}
++
++//
++// [NOTE]
++// The CRT can only set the access and the modification time, so the nanoseconds
++// and the ctime of the POSIX call are dropped; the cache file timestamps are
++// not used for cache validation, they are only informative.
++//
++inline int fuse_futimens(int fd, struct fuse_timespec times[2])
++{
++    struct __utimbuf64 ut = {};
++
++    if(!times){
++        return -1;
++    }
++    ut.actime  = times[0].tv_sec;
++    ut.modtime = times[1].tv_sec;
++
++    return _futime64(fd, &ut);
++}
++
++inline int fuse_utimensat(int dirfd, const char* path, const struct fuse_timespec times[2], int flags)
++{
++    struct __utimbuf64 ut = {};
++
++    (void)dirfd;
++    (void)flags;
++
++    if(!path){
++        return -1;
++    }
++    if(!times){
++        return -1;
++    }
++    ut.actime  = times[0].tv_sec;
++    ut.modtime = times[1].tv_sec;
++
++    return _wutime64(s3fs_utf8_to_wide(path).c_str(), &ut);
++}
++
++// The POSIX names of the stat timestamps(the CRT ones are read above).
++#define st_atime    st_atim.tv_sec
++#define st_mtime    st_mtim.tv_sec
++#define st_ctime    st_ctim.tv_sec
++
++//-------------------------------------------------------------------
++// POSIX functions the mingw-w64 headers do not declare
++//-------------------------------------------------------------------
++#define timegm      _mkgmtime
++
++inline struct tm* gmtime_r(const time_t* timer, struct tm* buf)
++{
++    return (0 == gmtime_s(buf, timer)) ? buf : nullptr;
++}
++
++inline struct tm* localtime_r(const time_t* timer, struct tm* buf)
++{
++    return (0 == localtime_s(buf, timer)) ? buf : nullptr;
++}
++
++//
++// [NOTE]
++// "struct timeval::tv_sec" is a long on mingw-w64, not a time_t, and
++// s3fs_logger.cpp hands it to gmtime_r().
++//
++inline struct tm* gmtime_r(const long* timer, struct tm* buf)
++{
++    const time_t sec = static_cast<time_t>(*timer);
++    return gmtime_r(&sec, buf);
++}
++
++inline struct tm* localtime_r(const long* timer, struct tm* buf)
++{
++    const time_t sec = static_cast<time_t>(*timer);
++    return localtime_r(&sec, buf);
++}
++
++//
++// clock_gettime() for the fuse_timespec that "struct timespec" now means: the
++// CRT only fills in its own structure.
++//
++inline int clock_gettime(int clk_id, struct fuse_timespec* tp)
++{
++    s3fs_crt_timespec crtnow;
++
++    int result = clock_gettime(clk_id, &crtnow);
++    if(0 == result && tp){
++        tp->tv_sec  = crtnow.tv_sec;
++        tp->tv_nsec = crtnow.tv_nsec;
++    }
++    return result;
++}
++
++inline int fsync(int fd)
++{
++    // _commit() is the CRT's name for flushing a file's buffers to the disk.
++    return _commit(fd);
++}
++
++//
++// A temporary file that is already "unlinked", the Unix way.
++//
++// FdManager::MakeTempFile() creates its scratch file with mkstemp() followed by
++// unlink(): the name disappears at once, the data stays readable and writable
++// through the descriptor, and nothing is left behind when the descriptor is
++// closed or the process dies.
++//
++// The Windows CRT cannot delete a file while a handle to it is open, so that
++// unlink() fails here with EACCES - which is what made every file open fail in
++// the r4 build("failed to delete tmp file. errno(13)").  _O_TEMPORARY is the
++// CRT's way of asking for FILE_FLAG_DELETE_ON_CLOSE, so the name goes away when
++// the last descriptor for the file is closed: the same observable behaviour,
++// including when the process is killed.
++//
++// s3fs_tempfile_unlinked() puts the open file `fd`, whose name is `path`, into
++// that state.  It returns the descriptor to use from then on - a new one, since
++// the file has to be reopened - or -1 with errno set, in which case `fd` has
++// been closed and `path` removed.
++//
++// [NOTE]
++// _O_TEMPORARY belongs to _sopen(), not to _open(), and it is the descriptor,
++// not the name, that owns the file: a dup()ed descriptor keeps the file alive
++// until it is closed too, exactly like on Unix.
++//
++inline int s3fs_tempfile_unlinked(int fd, const char* path)
++{
++    if(0 != _close(fd)){
++        return -1;
++    }
++    int newfd = _wsopen(s3fs_utf8_to_wide(path).c_str(), _O_RDWR | _O_BINARY | _O_TEMPORARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
++    if(-1 == newfd){
++        int saved_errno = errno;
++        unlink(path);                       // nothing can use the file any more
++        errno = saved_errno;
++        return -1;
++    }
++    return newfd;
++}
++
++inline long random(void)
++{
++    return static_cast<long>(rand());
++}
++
++//
++// [NOTE]
++// Not atomic: the CRT has no pread()/pwrite(), so the position is moved, the
++// transfer is done and the old position is put back.  Each handle is used by a
++// single thread in s3fs, which is what makes that safe here.
++//
++inline ssize_t pread(int fd, void* buf, size_t count, off_t offset)
++{
++    off_t   saved = _lseeki64(fd, 0, SEEK_CUR);
++    ssize_t result;
++
++    if(-1 == _lseeki64(fd, offset, SEEK_SET)){
++        return -1;
++    }
++    result = _read(fd, buf, count);
++    _lseeki64(fd, saved, SEEK_SET);
++
++    return result;
++}
++
++inline ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset)
++{
++    off_t   saved = _lseeki64(fd, 0, SEEK_CUR);
++    ssize_t result;
++
++    if(-1 == _lseeki64(fd, offset, SEEK_SET)){
++        return -1;
++    }
++    result = _write(fd, buf, count);
++    _lseeki64(fd, saved, SEEK_SET);
++
++    return result;
++}
++
++//-------------------------------------------------------------------
++// sysconf()/pwd/grp: Windows has no /etc/passwd, so the identity of the
++// caller is reported as the numeric id and the group is empty.
++//-------------------------------------------------------------------
++#define _SC_GETPW_R_SIZE_MAX    1
++#define _SC_GETGR_R_SIZE_MAX    2
++
++inline long sysconf(int name)
++{
++    (void)name;
++    return 1024;
++}
++
++struct passwd {
++    char*   pw_name;
++    char*   pw_passwd;
++    uid_t   pw_uid;
++    gid_t   pw_gid;
++    char*   pw_gecos;
++    char*   pw_dir;
++    char*   pw_shell;
++};
++
++struct group {
++    char*   gr_name;
++    char*   gr_passwd;
++    gid_t   gr_gid;
++    char**  gr_mem;
++};
++
++inline struct passwd* getpwuid(uid_t uid)
++{
++    static struct passwd  pw;
++    static char           name[32];
++    static char*          members[1] = { nullptr };
++
++    (void)members;
++    snprintf(name, sizeof(name), "u%u", static_cast<unsigned int>(uid));
++    pw.pw_name   = name;
++    pw.pw_passwd = const_cast<char*>("*");
++    pw.pw_uid    = uid;
++    pw.pw_gid    = 0;
++    pw.pw_gecos  = name;
++    pw.pw_dir    = const_cast<char*>("");
++    pw.pw_shell  = const_cast<char*>("");
++
++    return &pw;
++}
++
++inline int getpwuid_r(uid_t uid, struct passwd* pwd, char* buf, size_t buflen, struct passwd** res)
++{
++    if(nullptr == pwd || nullptr == buf || nullptr == res){
++        return EINVAL;
++    }
++    if(buflen < 32){
++        return ERANGE;
++    }
++    *res = nullptr;
++    snprintf(buf, buflen, "u%u", static_cast<unsigned int>(uid));
++    *pwd         = {};
++    pwd->pw_name = buf;
++    pwd->pw_dir  = const_cast<char*>("");
++    pwd->pw_uid  = uid;
++
++    *res = pwd;
++    return 0;
++}
++
++inline int getgrgid_r(gid_t gid, struct group* grp, char* buf, size_t buflen, struct group** res)
++{
++    static char* nomem[1] = { nullptr };
++
++    if(nullptr == grp || nullptr == buf || nullptr == res){
++        return EINVAL;
++    }
++    if(buflen < 32){
++        return ERANGE;
++    }
++    *res = nullptr;
++    snprintf(buf, buflen, "g%u", static_cast<unsigned int>(gid));
++    *grp         = {};
++    grp->gr_name = buf;
++    grp->gr_gid  = gid;
++    grp->gr_mem  = nomem;
++
++    *res = grp;
++    return 0;
++}
++
++inline uid_t getuid(void)  { return 0; }
++inline uid_t geteuid(void) { return 0; }
++inline gid_t getgid(void)  { return 0; }
++inline gid_t getegid(void) { return 0; }
++
++//-------------------------------------------------------------------
++// sigaction(): the CRT only has signal(), and s3fs uses sigaction() for
++// SIGUSR1/SIGUSR2(reload / rotate) and SIGHUP(rotate) which it raises itself.
++//-------------------------------------------------------------------
++#ifndef SIGHUP
++#define SIGHUP      1
++#endif
++#ifndef SIGUSR1
++#define SIGUSR1     30
++#endif
++#ifndef SIGUSR2
++#define SIGUSR2     31
++#endif
++#define SA_RESTART  0x1
++
++struct sigaction {
++    void (*sa_handler)(int);
++    int  sa_flags;
++};
++
++inline int sigaction(int sig, const struct sigaction* act, struct sigaction* oldact)
++{
++    (void)oldact;
++    if(!act){
++        return -1;
++    }
++    return (SIG_ERR == signal(sig, act->sa_handler)) ? -1 : 0;
++}
++
++//-------------------------------------------------------------------
++// The POSIX regex(<regex.h>) that addhead.cpp uses for -o add_head, mapped
++// onto std::regex.  Only the extended, no-subexpression form is needed.
++//-------------------------------------------------------------------
++struct regex_t {
++    std::regex  re;
++    bool        is_valid = false;
++};
++
++struct regmatch_t {
++    long long   rm_so;
++    long long   rm_eo;
++};
++
++#define REG_EXTENDED    0x1
++#define REG_NOSUB       0x2
++#define REG_NOTBOL      0x4
++#define REG_NOTEOL      0x8
++
++#define REG_NOMATCH     1
++#define REG_BADPAT      2
++
++inline int regcomp(regex_t* preg, const char* pattern, int cflags)
++{
++    (void)cflags;
++#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
++    try{
++        preg->re.assign(pattern, std::regex::extended | std::regex::nosubs);
++    }catch(...){
++        return REG_BADPAT;
++    }
++#else
++    // [NOTE]
++    // Built with -fno-exceptions: std::regex() cannot report a bad pattern, so
++    // an invalid -o add_head regex aborts instead of printing an error.  The
++    // Windows build passes -fexceptions(see the BUILD notes) to avoid this.
++    preg->re.assign(pattern, std::regex::extended | std::regex::nosubs);
++#endif
++    preg->is_valid = true;
++
++    return 0;
++}
++
++inline int regexec(const regex_t* preg, const char* string, size_t nmatch, regmatch_t pmatch[], int eflags)
++{
++    (void)eflags;
++
++    if(!preg || !preg->is_valid || !string){
++        return REG_NOMATCH;
++    }
++    std::cmatch m;
++    if(!std::regex_search(string, m, preg->re)){
++        return REG_NOMATCH;
++    }
++    if(nmatch && pmatch){
++        pmatch[0].rm_so = static_cast<long long>(m.position(0));
++        pmatch[0].rm_eo = static_cast<long long>(m.length(0) + m.position(0));
++    }
++    return 0;
++}
++
++inline void regfree(regex_t* preg)
++{
++    if(preg){
++        preg->re = std::regex();
++        preg->is_valid = false;
++    }
++}
++
++inline size_t regerror(int errcode, const regex_t* preg, char* errbuf, size_t errbuf_size)
++{
++    (void)preg;
++    const char* msg = (REG_NOMATCH == errcode) ? "regex did not match" : "regex error";
++    size_t      len = strlen(msg) + 1;
++
++    if(errbuf && 0 != errbuf_size){
++        snprintf(errbuf, errbuf_size, "%s", msg);
++    }
++    return len;
++}
++
++#endif  // __MSYS__
++
++#endif  // S3FS_WIN_POSIX_H_
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: expandtab sw=4 ts=4 fdm=marker
++ * vim<600: expandtab sw=4 ts=4
++ */
+diff --git a/src/win_readdir.h b/src/win_readdir.h
+new file mode 100644
+index 0000000..656f8f8
+--- /dev/null
++++ b/src/win_readdir.h
+@@ -0,0 +1,193 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Randy Rizun <rrozse@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef WIN_READDIR_H_
++#define WIN_READDIR_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <sys/stat.h>
++
++//
++// Helpers for the readdir callbacks of the Windows(WinFsp) build.
++//
++// They are compiled on every platform - like fuse_path_normalize() in
++// string_util.h - so that they can be unit tested with the Linux test
++// binaries.  Only their call sites in s3fs.cpp and s3fs_threadreqs.cpp are
++// inside #ifdef __MSYS__, so the Linux callbacks keep the upstream behaviour.
++//
++
++//-------------------------------------------------------------------
++// class DirHandleMap
++//-------------------------------------------------------------------
++//
++// Maps a directory handle(the fi->fh a FUSE callback gets) to the path that
++// opendir() was called with.
++//
++// WinFsp identifies an open directory by its file handle and hands readdir()
++// an empty path, while the Linux kernel always repeats the path.  s3fs has no
++// directory handle of its own, so without this table an empty path can only be
++// answered with ESTALE, which WinFsp reads as "end of directory": the mount
++// point opens but lists nothing.
++//
++// The table - and not a string malloc'ed into fi->fh - is used on purpose:
++// WinFsp is not required to call releasedir(), so an allocation handed to
++// fi->fh could leak, and a freed one could be read back by a late readdir().
++// A bounded table leaks neither and a stale handle simply misses.
++//
++class DirHandleMap
++{
++    public:
++        // Upper bound on the remembered paths.  If releasedir() is never
++        // called, the oldest handle is dropped once the table is full, so the
++        // memory stays bounded without any cooperation from the caller.
++        static constexpr std::size_t MaxEntries = 4096;
++
++        static DirHandleMap& Get()
++        {
++            static DirHandleMap singleton;
++            return singleton;
++        }
++
++        // Remember path and return the handle to store in fi->fh.  The handle
++        // is never 0, because 0 is what an untouched fi->fh holds.
++        std::uint64_t Store(const std::string& path)
++        {
++            const std::lock_guard<std::mutex> lock(handle_lock);
++
++            std::uint64_t handle = next_handle++;
++            if(0 == handle){          // only after wrapping around
++                handle = next_handle++;
++            }
++            while(MaxEntries <= path_map.size()){
++                path_map.erase(path_map.begin());     // std::map is ordered by handle
++            }
++            path_map.emplace(handle, path);
++            return handle;
++        }
++
++        // Copy the path of handle into path.  Returns false when the handle is
++        // 0, unknown or already forgotten.
++        bool Find(std::uint64_t handle, std::string& path) const
++        {
++            if(0 == handle){
++                return false;
++            }
++            const std::lock_guard<std::mutex> lock(handle_lock);
++
++            auto iter = path_map.find(handle);
++            if(path_map.cend() == iter){
++                return false;
++            }
++            path = iter->second;
++            return true;
++        }
++
++        // Forget handle.  Returns false when there was nothing to forget,
++        // which is the normal outcome on a platform without opendir() or after
++        // the entry was dropped to keep the table bounded.
++        bool Erase(std::uint64_t handle)
++        {
++            if(0 == handle){
++                return false;
++            }
++            const std::lock_guard<std::mutex> lock(handle_lock);
++
++            return 0 != path_map.erase(handle);
++        }
++
++        std::size_t Count() const
++        {
++            const std::lock_guard<std::mutex> lock(handle_lock);
++            return path_map.size();
++        }
++
++        // Only for the unit tests.
++        void Clear()
++        {
++            const std::lock_guard<std::mutex> lock(handle_lock);
++            path_map.clear();
++        }
++
++    private:
++        DirHandleMap() = default;
++        ~DirHandleMap() = default;
++        DirHandleMap(const DirHandleMap&)            = delete;
++        DirHandleMap(DirHandleMap&&)                 = delete;
++        DirHandleMap& operator=(const DirHandleMap&) = delete;
++        DirHandleMap& operator=(DirHandleMap&&)      = delete;
++
++        mutable std::mutex                     handle_lock;
++        std::map<std::uint64_t, std::string>   path_map;
++        std::uint64_t                          next_handle = 1;
++};
++
++//
++// The path a readdir() callback has to list.
++//
++// It is the path FUSE passed, or, when FUSE passed none, the one opendir()
++// stored under handle.  An empty return value means neither was available and
++// the caller answers ESTALE, as upstream does.
++//
++inline std::string resolve_dir_path(const char* path, std::uint64_t handle)
++{
++    if(path && '\0' != path[0]){
++        return path;
++    }
++
++    std::string stored;
++    if(0 != handle && DirHandleMap::Get().Find(handle, stored)){
++        return stored;
++    }
++    return std::string();
++}
++
++//
++// The stat to list an entry with when its HEAD request did not answer.
++//
++// Upstream leaves such an entry out of the listing, which is right for a
++// missing object but wrong for a request that merely failed: an empty listing
++// is worse than an entry whose size and timestamp are placeholders.
++//
++inline struct stat make_fallback_stat(bool is_dir)
++{
++    struct stat st = {};
++
++    st.st_mode  = (is_dir ? S_IFDIR : S_IFREG) |
++                  (is_dir ? (S_IRWXU | S_IRWXG | S_IRWXO)
++                          : (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH));
++    st.st_nlink = 1;
++    st.st_size  = 0;        // unknown: the object was not asked about successfully
++    return st;
++}
++
++#endif // WIN_READDIR_H_
++
++/*
++* Local variables:
++* tab-width: 4
++* c-basic-offset: 4
++* End:
++* vim600: expandtab sw=4 ts=4 fdm=marker
++* vim<600: expandtab sw=4 ts=4
++*/
+diff --git a/src/win_syslog.h b/src/win_syslog.h
+new file mode 100644
+index 0000000..257fbc4
+--- /dev/null
++++ b/src/win_syslog.h
+@@ -0,0 +1,68 @@
++/*
++ * s3fs - FUSE-based file system backed by Amazon S3
++ *
++ * Copyright(C) 2007 Takeshi Nakatani <ggtakec.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#ifndef S3FS_WIN_SYSLOG_H_
++#define S3FS_WIN_SYSLOG_H_
++
++//
++// A <syslog.h> for the Windows(mingw-w64) build.
++//
++// There is no syslog daemon on Windows, so the calls are stubbed out: s3fs
++// keeps writing its log to the console and to the file given by -o logfile,
++// which is the only thing that works in a WinFsp session anyway.  The level
++// constants are the ones from the Single UNIX Specification, they are only
++// compared with each other here.
++//
++// This header is included instead of <syslog.h> when building with __MSYS__
++// (see s3fs_logger.h), so the POSIX builds do not see it at all.
++//
++
++#define LOG_EMERG       0       /* system is unusable */
++#define LOG_ALERT       1       /* action must be taken immediately */
++#define LOG_CRIT        2       /* critical conditions */
++#define LOG_ERR         3       /* error conditions */
++#define LOG_WARNING     4       /* warning conditions */
++#define LOG_NOTICE      5       /* normal but significant condition */
++#define LOG_INFO        6       /* informational */
++#define LOG_DEBUG       7       /* debug-level messages */
++
++#define LOG_PID         0x01    /* log the process id with each message */
++#define LOG_ODELAY      0x04    /* delay open until first syslog() */
++#define LOG_NOWAIT      0x20    /* don't wait for child processes */
++
++#define LOG_USER        1       /* random user-level messages */
++
++#define LOG_UPTO(p)     (p)     /* setlogmask() is a no-op, so the mask is the level */
++
++inline void openlog(const char* /*ident*/, int /*option*/, int /*facility*/) {}
++inline void closelog() {}
++inline int  setlogmask(int /*mask*/) { return 0; }
++inline void syslog(int /*priority*/, const char* /*fmt*/, ...) {}
++
++#endif // S3FS_WIN_SYSLOG_H_
++
++/*
++ * Local variables:
++ * tab-width: 4
++ * c-basic-offset: 4
++ * End:
++ * vim600: expandtab sw=4 ts=4 fdm=marker
++ * vim<600: expandtab sw=4 ts=4
++ */
+diff --git a/test/Makefile.am b/test/Makefile.am
+index a3c424a..5eacfd6 100644
+--- a/test/Makefile.am
++++ b/test/Makefile.am
+@@ -29,10 +29,27 @@ EXTRA_DIST = \
+ 
+ testdir = test
+ 
++#
++# The Windows(mingw) build needs the POSIX layer in src/win_posix.h, and the
++# test programs below do not include any s3fs header of their own.  The header
++# is empty unless __MSYS__ is defined, so the other builds are unaffected.
++#
++AM_CPPFLAGS = -I$(top_srcdir)/src -include win_posix.h
++
++#
++# mknod_test uses mknod(), which mingw's CRT does not have, so it is not built
++# when cross compiling for Windows.
++#
++if MINGW_HOST
++MKNOD_TEST =
++else
++MKNOD_TEST = mknod_test
++endif
++
+ noinst_PROGRAMS = \
+     junk_data \
+     write_multiblock \
+-    mknod_test \
++    $(MKNOD_TEST) \
+     truncate_read_file \
+     path_truncate \
+     cr_filename \

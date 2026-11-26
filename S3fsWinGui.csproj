@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- Linux 上交叉编译 Windows TFM 必需 -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+
+    <RootNamespace>S3fsWin</RootNamespace>
+    <AssemblyName>s3fs-win</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <Version>1.97.2.0</Version>
+    <Product>s3fs-win</Product>
+    <Description>s3fs.exe（WinFsp 版 s3fs-fuse 1.97）的 Windows 托盘前端</Description>
+
+    <!-- 要求 0 警告 0 错误：任何警告都当错误处理 -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- net8.0 已进入支持末期，别让 NETSDK1138 干扰构建；
+         NETSDK1244 只是「IncludeAllContentForSelfExtract 是旧版兼容模式」的提醒，
+         这里正是为了把 WindowsDesktop 的原生 DLL 也打进单文件、让 publish 只剩一个 exe 才用它。 -->
+    <NoWarn>$(NoWarn);NETSDK1138;NETSDK1244</NoWarn>
+    <!-- 让 publish 目录里只剩一个 exe（不带 pdb / 附属资源目录）。
+         WindowsDesktop 的几个原生 DLL 默认被标成 ExcludeFromSingleFile，
+         IncludeAllContentForSelfExtract 强制全部打进单文件里（首次运行解压到临时目录）。 -->
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+  </PropertyGroup>
+
+</Project>
