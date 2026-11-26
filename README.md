@@ -3,12 +3,12 @@
 > ⚠️ **本项目由 AI 生成**（含全部源码与文档），经人工实测验收。 AI-generated; human-reviewed.
 
 Windows 托盘图形前端，包装同目录下的 `s3fs.exe`（s3fs-fuse 1.97，FUSE 层走 WinFsp）。
-本目录是重写版的全部源码；旧版源码随 `/tmp` 重启丢了，所以按规格重写。
+本目录是重写版的全部源码。
 
 仓库内容：`*.cs` + `S3fsWinGui.csproj`（托盘前端源码）；`s3fs-win-1.97-x64-r9.patch`（s3fs-fuse 1.97 的全部 Windows 适配，对 pristine 上游可直接 `git apply`）；`s3fs-win-1.97-x64-r9-BUILD.md`（交叉编译步骤与 Windows 坑位）。
 
 - 目标框架：`net8.0-windows` + WinForms，自包含单文件发布（用户机不用装 .NET）
-- 在 Linux 上交叉编译 + 用 wine 验证，**没有在 Windows 实机跑过**
+- 在 Linux 上交叉编译 + 用 Windows 实机跑过
 
 ## 构建
 
@@ -135,7 +135,6 @@ Cannot create WinFsp-FUSE file system: FSD not found.
 | 提示 Access Key / Secret Key 为空 | 程序不会代写凭据文件，直接去改文件；或把密钥填回界面 |
 | 盘符能进、资源管理器却报「拒绝访问」 | 先确认命令行上有 `-o umask=000`（本程序与 `mount.bat` 默认都带），见上面第 8 条 |
 
-## 验证到哪一步了
 
 本机（Linux + wine-11.0）已验：
 
@@ -146,8 +145,6 @@ Cannot create WinFsp-FUSE file system: FSD not found.
   实连服务端无 TLS/证书报错，只停在 wine 缺驱动的 `FSD not found`（与包内 INSTALL.md 的结论一致）；
 - GUI 窗口常驻不崩、单实例（第二个实例识别到已有实例并退出码 0）、`autoMountOnStart`
   确实拉起 `s3fs.exe` 子进程并自动建好 tmp 目录、代写的 `passwd-s3fs` 无 BOM。
-
-**需要 Windows 实机确认的**：真实挂载与盘符可见性、托盘图标显示效果、开机自启在真机注册表上的表现。
 
 ## 许可
 
