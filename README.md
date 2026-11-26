@@ -148,3 +148,8 @@ Cannot create WinFsp-FUSE file system: FSD not found.
   确实拉起 `s3fs.exe` 子进程并自动建好 tmp 目录、代写的 `passwd-s3fs` 无 BOM。
 
 **需要 Windows 实机确认的**：真实挂载与盘符可见性、托盘图标显示效果、开机自启在真机注册表上的表现。
+
+## 许可
+
+本项目（GUI 源码、Windows 适配补丁、文档）以 **GPL-2.0-or-later** 分发，与上游 s3fs-fuse 一致；
+补丁部分派生自 [s3fs-fuse](https://github.com/s3fs-fuse/s3fs-fuse)（其版权归上游作者），完整许可文本见 [LICENSE](LICENSE)。
